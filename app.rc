@@ -1,0 +1,5 @@
+#include <windows.h>
+
+// 将高 DPI/通用控件清单与多尺寸应用图标嵌入最终可执行文件。
+1 RT_MANIFEST "app.manifest"
+101 ICON "app.ico"
