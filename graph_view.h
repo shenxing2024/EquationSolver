@@ -1,6 +1,6 @@
 #pragma once
 
-// Win32 图像视图：在同一坐标系绘制等号两侧函数或二元方程组的两条直线。
+// Win32 图像视图：在同一坐标系绘制等号两侧函数或二元方程组的两条隐式曲线。
 
 #include <string>
 #include <utility>

@@ -4,6 +4,7 @@
 #include "graph_view.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cwctype>
 #include <iomanip>
@@ -55,8 +56,16 @@ std::wstring normalize(std::wstring text) {
             ch = L'"';
     }
     std::wstring result;
-    for (wchar_t ch : text)
-        result += ch == L'²' ? L"^2" : std::wstring(1, ch);
+    for (wchar_t ch : text) {
+        if (ch == L'²')
+            result += L"^2";
+        else if (ch == L'³')
+            result += L"^3";
+        else if (ch == L'⁴')
+            result += L"^4";
+        else
+            result += ch;
+    }
     return result;
 }
 
@@ -374,7 +383,7 @@ std::wstring shortNumber(double value) {
 }
 
 void paint(HWND window, State& state) {
-    // 先确定自适应坐标范围，再采样等号两侧；方程组则绘制两条直线。
+    // 先确定自适应坐标范围，再采样等号两侧；方程组则绘制两条隐式曲线。
     PAINTSTRUCT ps{};
     HDC dc = BeginPaint(window, &ps);
     RECT client{};
@@ -493,18 +502,68 @@ void paint(HWND window, State& state) {
                 return evaluate(eq.left, x, y, state.request.degreeMode) -
                        evaluate(eq.right, x, y, state.request.degreeMode);
             };
-            const double c = f(0, 0), a = f(1, 0) - c, b = f(0, 1) - c;
             HPEN pen = CreatePen(PS_SOLID, 2, curveColors[index]);
             HGDIOBJ saved = SelectObject(memory, pen);
-            if (std::isfinite(a) && std::isfinite(b) && std::isfinite(c)) {
-                if (std::abs(b) > 1e-10) {
-                    const double y1 = -(a * -xExtent + c) / b, y2 = -(a * xExtent + c) / b;
-                    MoveToEx(memory, px(-xExtent), py(y1), nullptr);
-                    LineTo(memory, px(xExtent), py(y2));
-                } else if (std::abs(a) > 1e-10) {
-                    const int x = px(-c / a);
-                    MoveToEx(memory, x, plot.top, nullptr);
-                    LineTo(memory, x, plot.bottom);
+
+            // 用 marching squares 绘制 f(x,y)=0 的隐式曲线。线性方程、圆、椭圆、
+            // 双曲线和一般二次曲线都走同一条路径，避免把二次方程误画成直线。
+            const int columns = std::clamp<int>((plot.right - plot.left) / 3, 80, 260);
+            const int rows = std::clamp<int>((plot.bottom - plot.top) / 3, 60, 200);
+            std::vector<double> samples(static_cast<size_t>(columns + 1) * (rows + 1), kInvalid);
+            const auto sampleIndex = [&](int column, int row) {
+                return static_cast<size_t>(row) * (columns + 1) + column;
+            };
+            for (int row = 0; row <= rows; ++row) {
+                const double y = yExtent - 2.0 * yExtent * row / rows;
+                for (int column = 0; column <= columns; ++column) {
+                    const double x = -xExtent + 2.0 * xExtent * column / columns;
+                    samples[sampleIndex(column, row)] = f(x, y);
+                }
+            }
+
+            struct ContourPoint {
+                double x = 0.0;
+                double y = 0.0;
+            };
+            const auto crossing = [](double first, double second) {
+                if (!std::isfinite(first) || !std::isfinite(second))
+                    return false;
+                if (std::abs(first) < 1e-12 || std::abs(second) < 1e-12)
+                    return true;
+                return std::signbit(first) != std::signbit(second);
+            };
+            const auto interpolate = [](ContourPoint firstPoint, ContourPoint secondPoint, double first,
+                                        double second) {
+                double ratio = std::abs(first - second) < 1e-20 ? 0.5 : first / (first - second);
+                ratio = std::clamp(ratio, 0.0, 1.0);
+                return ContourPoint{firstPoint.x + (secondPoint.x - firstPoint.x) * ratio,
+                                    firstPoint.y + (secondPoint.y - firstPoint.y) * ratio};
+            };
+            for (int row = 0; row < rows; ++row) {
+                const double top = yExtent - 2.0 * yExtent * row / rows;
+                const double bottom = yExtent - 2.0 * yExtent * (row + 1) / rows;
+                for (int column = 0; column < columns; ++column) {
+                    const double left = -xExtent + 2.0 * xExtent * column / columns;
+                    const double right = -xExtent + 2.0 * xExtent * (column + 1) / columns;
+                    const std::array<ContourPoint, 4> corners{
+                        ContourPoint{left, top}, ContourPoint{right, top},
+                        ContourPoint{right, bottom}, ContourPoint{left, bottom}};
+                    const std::array<double, 4> values{
+                        samples[sampleIndex(column, row)], samples[sampleIndex(column + 1, row)],
+                        samples[sampleIndex(column + 1, row + 1)], samples[sampleIndex(column, row + 1)]};
+                    std::vector<ContourPoint> intersections;
+                    for (int edge = 0; edge < 4; ++edge) {
+                        const int next = (edge + 1) % 4;
+                        if (crossing(values[edge], values[next]))
+                            intersections.push_back(
+                                interpolate(corners[edge], corners[next], values[edge], values[next]));
+                    }
+                    if (intersections.size() < 2)
+                        continue;
+                    for (size_t point = 0; point + 1 < intersections.size(); point += 2) {
+                        MoveToEx(memory, px(intersections[point].x), py(intersections[point].y), nullptr);
+                        LineTo(memory, px(intersections[point + 1].x), py(intersections[point + 1].y));
+                    }
                 }
             }
             SelectObject(memory, saved);

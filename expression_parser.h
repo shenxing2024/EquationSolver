@@ -10,7 +10,19 @@
 
 namespace equation {
 
-enum class InputKind { Auto, Linear, Linear2, Quadratic, Linear3, Inequality, Fraction, Trigonometric };
+enum class InputKind {
+    Auto,
+    Linear,
+    Linear2,
+    Quadratic,
+    Quadratic2,
+    Cubic,
+    Quartic,
+    Linear3,
+    Inequality,
+    Fraction,
+    Trigonometric
+};
 enum class AngleUnit { Radians, Degrees };
 
 // 面向界面的可恢复输入错误；消息统一使用 UTF-8，便于三语言转换。

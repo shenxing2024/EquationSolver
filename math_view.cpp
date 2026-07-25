@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cstring>
 #include <cwctype>
+#include <wtypes.h>
+#include <gdiplus.h>
 #include <limits>
 #include <string>
 #include <vector>
@@ -36,6 +38,11 @@ struct ViewState {
     int contentHeight = 0;
     bool dragging = false;
     int dragOffset = 0;
+    int maxVisualLines = std::numeric_limits<int>::max();
+    int lastClickedLine = -1;
+    std::vector<std::pair<int, int>> lineBounds;
+    std::vector<std::pair<int, int>> clickableLineGroups;
+    int hoveredGroup = -1;
 };
 
 COLORREF backgroundColor(const ViewState& state) {
@@ -128,8 +135,15 @@ bool parseRadical(const std::wstring& line, size_t start, Element& element, size
     }
     std::wstring radicand;
     if (cursor < line.size() && line[cursor] == L'{') {
-        const size_t close = line.find(L'}', cursor + 1);
-        if (close == std::wstring::npos)
+        int depth = 0;
+        size_t close = cursor;
+        for (; close < line.size(); ++close) {
+            if (line[close] == L'{')
+                ++depth;
+            else if (line[close] == L'}' && --depth == 0)
+                break;
+        }
+        if (close >= line.size())
             return false;
         radicand = line.substr(cursor + 1, close - cursor - 1);
         cursor = close + 1;
@@ -235,7 +249,6 @@ void drawElement(HDC dc, const Element& element, int x, int top, int lineHeight,
         radicandHeight = std::max(radicandHeight, measureElement(dc, part, baseHeight).height);
     }
     const int radicandTop = top + (lineHeight - radicandHeight) / 2;
-    const int y = radicandTop + (radicandHeight - baseHeight) / 2;
     const int rootWidth = measureText(dc, L"√");
     int cursor = x;
     if (!element.second.empty()) {
@@ -245,22 +258,39 @@ void drawElement(HDC dc, const Element& element, int x, int top, int lineHeight,
         logFont.lfHeight = static_cast<LONG>(logFont.lfHeight * 0.62);
         HFONT indexFont = CreateFontIndirectW(&logFont);
         HGDIOBJ oldFont = SelectObject(dc, indexFont);
-        TextOutW(dc, cursor, y, element.second.c_str(), static_cast<int>(element.second.size()));
+        const int indexTop = radicandTop + std::max(1, radicandHeight / 3 - baseHeight / 3);
+        TextOutW(dc, cursor, indexTop, element.second.c_str(), static_cast<int>(element.second.size()));
         const int indexWidth = measureText(dc, element.second);
         SelectObject(dc, oldFont);
         DeleteObject(indexFont);
         cursor += std::max(5, indexWidth - 2);
     }
-    TextOutW(dc, cursor, y, L"√", 1);
+    const int rootLeft = cursor;
     cursor += rootWidth - 1;
-    drawInlineMath(dc, element.first, cursor, radicandTop, radicandHeight, baseHeight, color);
+    drawInlineMath(dc, element.first, cursor, radicandTop + 3, radicandHeight - 3, baseHeight, color);
     const int radicandWidth = inlineMathWidth(dc, element.first, baseHeight);
-    HPEN pen = CreatePen(PS_SOLID, 1, color);
-    HGDIOBJ oldPen = SelectObject(dc, pen);
-    MoveToEx(dc, cursor - 1, y + 1, nullptr);
-    LineTo(dc, cursor + radicandWidth + 1, y + 1);
-    SelectObject(dc, oldPen);
-    DeleteObject(pen);
+    const int barY = radicandTop + 2;
+    const int bottom = radicandTop + radicandHeight - 2;
+    const int shoulderY = radicandTop + radicandHeight * 3 / 5;
+    // GDI 折线在斜边处会产生明显锯齿。根号改用 GDI+ 的浮点路径，
+    // 并启用高质量像素偏移、圆角连接和圆形端点。
+    Gdiplus::Graphics graphics(dc);
+    graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    graphics.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+    Gdiplus::Pen pen(Gdiplus::Color(255, GetRValue(color), GetGValue(color), GetBValue(color)), 1.35f);
+    pen.SetLineJoin(Gdiplus::LineJoinRound);
+    pen.SetStartCap(Gdiplus::LineCapRound);
+    pen.SetEndCap(Gdiplus::LineCapRound);
+    const Gdiplus::PointF points[]{
+        {static_cast<Gdiplus::REAL>(rootLeft + 1), static_cast<Gdiplus::REAL>(shoulderY)},
+        {static_cast<Gdiplus::REAL>(rootLeft + std::max(3, rootWidth / 3)),
+         static_cast<Gdiplus::REAL>(shoulderY - 2)},
+        {static_cast<Gdiplus::REAL>(rootLeft + std::max(5, rootWidth / 2)),
+         static_cast<Gdiplus::REAL>(bottom)},
+        {static_cast<Gdiplus::REAL>(cursor), static_cast<Gdiplus::REAL>(barY)},
+        {static_cast<Gdiplus::REAL>(cursor + radicandWidth + 1), static_cast<Gdiplus::REAL>(barY)},
+    };
+    graphics.DrawLines(&pen, points, static_cast<INT>(std::size(points)));
 }
 
 int inlineMathWidth(HDC dc, const std::wstring& text, int baseHeight) {
@@ -313,9 +343,14 @@ int layoutAndDraw(ViewState& state, HDC dc, const RECT& client, bool draw, bool 
     int visualLines = 0;
     bool limitReached = false;
 
-    for (const auto& line : splitLines(state.text)) {
+    if (!draw)
+        state.lineBounds.clear();
+    const auto lines = splitLines(state.text);
+    for (size_t lineIndex = 0; lineIndex < lines.size(); ++lineIndex) {
         if (visualLines >= maxVisualLines)
             break;
+        const auto& line = lines[lineIndex];
+        const int logicalLineTop = y;
         const std::vector<Element> elements =
             plainText ? std::vector<Element>{{ElementKind::Text, line, L""}} : parseElements(line);
         int lineHeight = baseHeight + 3;
@@ -324,6 +359,8 @@ int layoutAndDraw(ViewState& state, HDC dc, const RECT& client, bool draw, bool 
         int x = kPaddingX;
         if (elements.empty()) {
             y += std::max(6, baseHeight / 2);
+            if (!draw)
+                state.lineBounds.push_back({logicalLineTop, y});
             continue;
         }
         for (const auto& element : elements) {
@@ -377,6 +414,8 @@ int layoutAndDraw(ViewState& state, HDC dc, const RECT& client, bool draw, bool 
             break;
         ++visualLines;
         y += lineHeight;
+        if (!draw)
+            state.lineBounds.push_back({logicalLineTop, y});
     }
     SelectObject(dc, oldFont);
     SetBkMode(dc, oldBackgroundMode);
@@ -430,6 +469,48 @@ void drawScrollbar(HDC dc, const RECT& client, const ViewState& state) {
     DeleteObject(pen);
 }
 
+int lineAtPoint(const ViewState& state, int y) {
+    for (size_t index = 0; index < state.lineBounds.size(); ++index) {
+        const auto [top, bottom] = state.lineBounds[index];
+        if (y >= top && y < bottom)
+            return static_cast<int>(index);
+    }
+    return -1;
+}
+
+int groupForLine(const ViewState& state, int line) {
+    if (line < 0)
+        return -1;
+    for (size_t index = 0; index < state.clickableLineGroups.size(); ++index) {
+        const auto [first, last] = state.clickableLineGroups[index];
+        if (line >= first && line <= last)
+            return static_cast<int>(index);
+    }
+    return -1;
+}
+
+void drawHoveredGroup(HDC dc, const RECT& client, const ViewState& state, bool hasScrollbar) {
+    if (state.hoveredGroup < 0 || state.hoveredGroup >= static_cast<int>(state.clickableLineGroups.size()))
+        return;
+    const auto [first, last] = state.clickableLineGroups[static_cast<size_t>(state.hoveredGroup)];
+    if (first < 0 || last < first || last >= static_cast<int>(state.lineBounds.size()))
+        return;
+    RECT card{5, state.lineBounds[static_cast<size_t>(first)].first + 2,
+              client.right - (hasScrollbar ? kScrollbarWidth : 0) - 5,
+              state.lineBounds[static_cast<size_t>(last)].second - 2};
+    if (card.bottom <= 0 || card.top >= client.bottom)
+        return;
+    HBRUSH fill = CreateSolidBrush(state.darkMode ? RGB(35, 45, 62) : RGB(247, 250, 255));
+    HPEN border = CreatePen(PS_SOLID, 2, RGB(55, 126, 255));
+    HGDIOBJ oldBrush = SelectObject(dc, fill);
+    HGDIOBJ oldPen = SelectObject(dc, border);
+    RoundRect(dc, card.left, card.top, card.right, card.bottom, 10, 10);
+    SelectObject(dc, oldPen);
+    SelectObject(dc, oldBrush);
+    DeleteObject(border);
+    DeleteObject(fill);
+}
+
 void copyTextToClipboard(HWND window, const std::wstring& text) {
     if (!OpenClipboard(window))
         return;
@@ -449,6 +530,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     auto* state = reinterpret_cast<ViewState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
     if (message == WM_CREATE) {
         state = new ViewState();
+        if ((GetWindowLongPtrW(window, GWL_STYLE) & kTwoLineSummary) != 0)
+            state->maxVisualLines = 2;
         SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
         return 0;
     }
@@ -459,6 +542,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
     case WM_SETTEXT:
         state->text = lParam ? reinterpret_cast<const wchar_t*>(lParam) : L"";
         state->scrollY = 0;
+        state->lineBounds.clear();
+        state->hoveredGroup = -1;
         InvalidateRect(window, nullptr, TRUE);
         return TRUE;
     case WM_GETTEXTLENGTH:
@@ -482,6 +567,20 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         state->darkMode = wParam != 0;
         InvalidateRect(window, nullptr, TRUE);
         return 0;
+    case kSetMaxVisualLines:
+        state->maxVisualLines =
+            wParam == 0 ? std::numeric_limits<int>::max() : std::max(1, static_cast<int>(wParam));
+        InvalidateRect(window, nullptr, TRUE);
+        return 0;
+    case kGetLastClickedLine:
+        return state->lastClickedLine;
+    case kSetClickableLineGroups: {
+        const auto* groups = reinterpret_cast<const std::vector<std::pair<int, int>>*>(lParam);
+        state->clickableLineGroups = groups ? *groups : std::vector<std::pair<int, int>>{};
+        state->hoveredGroup = -1;
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    }
     case WM_ERASEBKGND:
         return 1;
     case WM_PAINT: {
@@ -498,12 +597,13 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
         const LONG_PTR style = GetWindowLongPtrW(window, GWL_STYLE);
         const bool hasScrollbar = (style & kVerticalScroll) != 0;
         const bool plainText = (style & kPlainText) != 0;
-        const int maxVisualLines = (style & kTwoLineSummary) != 0 ? 2 : std::numeric_limits<int>::max();
+        const int maxVisualLines = state->maxVisualLines;
         if (!hasScrollbar)
             state->scrollY = 0;
         state->contentHeight =
             layoutAndDraw(*state, memoryDc, client, false, hasScrollbar, maxVisualLines, plainText);
         clampScroll(*state, client);
+        drawHoveredGroup(memoryDc, client, *state, hasScrollbar);
         layoutAndDraw(*state, memoryDc, client, true, hasScrollbar, maxVisualLines, plainText);
         if (hasScrollbar)
             drawScrollbar(memoryDc, client, *state);
@@ -561,9 +661,26 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                 state->scrollY += client.bottom;
             clampScroll(*state, client);
             InvalidateRect(window, nullptr, FALSE);
+        } else if ((GetWindowLongPtrW(window, GWL_STYLE) & kClickableLines) != 0) {
+            state->lastClickedLine = lineAtPoint(*state, y);
+            if (state->lastClickedLine >= 0) {
+                SendMessageW(GetParent(window), WM_COMMAND,
+                             MAKEWPARAM(GetDlgCtrlID(window), kLineClickedNotification),
+                             reinterpret_cast<LPARAM>(window));
+            }
         }
         return 0;
     }
+    case WM_SETCURSOR:
+        if ((GetWindowLongPtrW(window, GWL_STYLE) & kClickableLines) != 0 && LOWORD(lParam) == HTCLIENT) {
+            POINT point{};
+            GetCursorPos(&point);
+            ScreenToClient(window, &point);
+            const int group = groupForLine(*state, lineAtPoint(*state, point.y));
+            SetCursor(LoadCursorW(nullptr, group >= 0 ? IDC_HAND : IDC_ARROW));
+            return TRUE;
+        }
+        return DefWindowProcW(window, message, wParam, lParam);
     case WM_MOUSEMOVE:
         if (state->dragging) {
             RECT client{};
@@ -577,6 +694,20 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lPa
                 std::clamp(GET_Y_LPARAM(lParam) - state->dragOffset - kArrowHeight, 0, travel);
             const int maxScroll = std::max(0, state->contentHeight - clientHeight);
             state->scrollY = position * maxScroll / travel;
+            InvalidateRect(window, nullptr, FALSE);
+        } else if ((GetWindowLongPtrW(window, GWL_STYLE) & kClickableLines) != 0) {
+            const int hovered = groupForLine(*state, lineAtPoint(*state, GET_Y_LPARAM(lParam)));
+            if (hovered != state->hoveredGroup) {
+                state->hoveredGroup = hovered;
+                InvalidateRect(window, nullptr, FALSE);
+            }
+            TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0};
+            TrackMouseEvent(&tracking);
+        }
+        return 0;
+    case WM_MOUSELEAVE:
+        if (state->hoveredGroup >= 0) {
+            state->hoveredGroup = -1;
             InvalidateRect(window, nullptr, FALSE);
         }
         return 0;
@@ -636,6 +767,18 @@ bool registerClass(HINSTANCE instance) {
 
 void setDarkMode(HWND window, bool darkMode) {
     SendMessageW(window, kSetDarkMode, darkMode ? 1 : 0, 0);
+}
+
+void setMaxVisualLines(HWND window, int maxVisualLines) {
+    SendMessageW(window, kSetMaxVisualLines, static_cast<WPARAM>(std::max(0, maxVisualLines)), 0);
+}
+
+int lastClickedLine(HWND window) {
+    return static_cast<int>(SendMessageW(window, kGetLastClickedLine, 0, 0));
+}
+
+void setClickableLineGroups(HWND window, const std::vector<std::pair<int, int>>& groups) {
+    SendMessageW(window, kSetClickableLineGroups, 0, reinterpret_cast<LPARAM>(&groups));
 }
 
 int preferredWidth(HWND window) {
