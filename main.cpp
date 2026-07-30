@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <cmath>
 #include <complex>
 #include <cstdint>
 #include <cstdlib>
@@ -63,6 +64,21 @@ constexpr DWORD kWindowCornerPreferenceAttribute = 33;
 constexpr DWORD kCaptionColorAttribute = 35;
 constexpr DWORD kCaptionTextColorAttribute = 36;
 constexpr UINT kDropdownCommitMessage = WM_APP + 101;
+constexpr int kDesignWindowWidth = 1080;
+constexpr int kDesignWindowHeight = 720;
+constexpr int kReferenceWorkWidth = 1600;
+constexpr int kReferenceWorkHeight = 900;
+
+double displayScaleForWorkArea(int workWidth, int workHeight, UINT dpi) {
+    const double dpiScale = std::max(0.5, static_cast<double>(dpi) / 96.0);
+    const double resolutionScale =
+        std::min(static_cast<double>(workWidth) / kReferenceWorkWidth,
+                 static_cast<double>(workHeight) / kReferenceWorkHeight);
+    const double availableScale =
+        std::min(static_cast<double>(std::max(1, workWidth - 32)) / kDesignWindowWidth,
+                 static_cast<double>(std::max(1, workHeight - 32)) / kDesignWindowHeight);
+    return std::clamp(std::min(std::max(dpiScale, resolutionScale), availableScale), 0.5, 1.75);
+}
 
 enum class Language { Simplified, English, Traditional };
 enum class DropdownKind { None, Type, Language, AngleUnit };
@@ -1366,15 +1382,24 @@ class SolverApp {
         dropdownClass.lpszClassName = kDropdownWindowClass;
         if (!RegisterClassExW(&dropdownClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
             return false;
+
+        const HMONITOR monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        MONITORINFO monitorInfo{};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        GetMonitorInfoW(monitor, &monitorInfo);
+        updateDisplayScale(monitor, GetDpiForSystem(), false);
+        const int workWidth = static_cast<int>(monitorInfo.rcWork.right - monitorInfo.rcWork.left);
+        const int workHeight = static_cast<int>(monitorInfo.rcWork.bottom - monitorInfo.rcWork.top);
+        const int windowWidth = std::min(scaled(kDesignWindowWidth), workWidth);
+        const int windowHeight = std::min(scaled(kDesignWindowHeight), workHeight);
+        const int windowX =
+            monitorInfo.rcWork.left + (monitorInfo.rcWork.right - monitorInfo.rcWork.left - windowWidth) / 2;
+        const int windowY =
+            monitorInfo.rcWork.top + (monitorInfo.rcWork.bottom - monitorInfo.rcWork.top - windowHeight) / 2;
         window_ = CreateWindowExW(0, kWindowClass, L"方程求解器", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-                                  CW_USEDEFAULT, CW_USEDEFAULT, 1080, 720, nullptr, nullptr, instance_, this);
+                                  windowX, windowY, windowWidth, windowHeight, nullptr, nullptr, instance_, this);
         if (!window_)
             return false;
-        RECT rect{};
-        GetWindowRect(window_, &rect);
-        SetWindowPos(window_, nullptr, (GetSystemMetrics(SM_CXSCREEN) - (rect.right - rect.left)) / 2,
-                     (GetSystemMetrics(SM_CYSCREEN) - (rect.bottom - rect.top)) / 2, 0, 0,
-                     SWP_NOSIZE | SWP_NOZORDER);
         ShowWindow(window_, showCommand);
         UpdateWindow(window_);
         return true;
@@ -1476,6 +1501,121 @@ class SolverApp {
         return DefSubclassProc(hwnd, message, wParam, lParam);
     }
 
+    int scaled(int value) const {
+        return std::max(value > 0 ? 1 : 0, static_cast<int>(std::lround(value * uiScale_)));
+    }
+
+    Gdiplus::REAL scaledReal(double value) const {
+        return static_cast<Gdiplus::REAL>(value * uiScale_);
+    }
+
+    bool updateDisplayScale(HMONITOR monitor, UINT dpi, bool refreshFonts) {
+        MONITORINFO info{};
+        info.cbSize = sizeof(info);
+        if (!GetMonitorInfoW(monitor, &info))
+            return false;
+        const double nextScale =
+            displayScaleForWorkArea(info.rcWork.right - info.rcWork.left,
+                                    info.rcWork.bottom - info.rcWork.top, dpi ? dpi : 96);
+        const bool changed = std::abs(nextScale - uiScale_) > 0.005 || currentDpi_ != dpi;
+        uiScale_ = nextScale;
+        currentDpi_ = dpi ? dpi : 96;
+        if (changed && refreshFonts && normalFont_) {
+            closeDropdown();
+            recreateFonts();
+            for (const auto& secondary :
+                 {std::pair<HWND, SIZE>{logWindow_, SIZE{scaled(680), scaled(560)}},
+                  std::pair<HWND, SIZE>{graphWindow_, SIZE{scaled(860), scaled(640)}}}) {
+                if (!secondary.first)
+                    continue;
+                RECT rect{};
+                GetWindowRect(secondary.first, &rect);
+                const int centerX = rect.left + (rect.right - rect.left) / 2;
+                const int centerY = rect.top + (rect.bottom - rect.top) / 2;
+                SetWindowPos(secondary.first, nullptr, centerX - secondary.second.cx / 2,
+                             centerY - secondary.second.cy / 2, secondary.second.cx, secondary.second.cy,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
+        return changed;
+    }
+
+    void adaptWindowToMonitor(HMONITOR monitor, UINT dpi, const RECT& referenceRect) {
+        updateDisplayScale(monitor, dpi, true);
+        MONITORINFO info{};
+        info.cbSize = sizeof(info);
+        if (!GetMonitorInfoW(monitor, &info))
+            return;
+        const int workWidth = info.rcWork.right - info.rcWork.left;
+        const int workHeight = info.rcWork.bottom - info.rcWork.top;
+        const int windowWidth = std::min(scaled(kDesignWindowWidth), workWidth);
+        const int windowHeight = std::min(scaled(kDesignWindowHeight), workHeight);
+        const int centerX = referenceRect.left + (referenceRect.right - referenceRect.left) / 2;
+        const int centerY = referenceRect.top + (referenceRect.bottom - referenceRect.top) / 2;
+        const int workLeft = static_cast<int>(info.rcWork.left);
+        const int workTop = static_cast<int>(info.rcWork.top);
+        const int workRight = static_cast<int>(info.rcWork.right);
+        const int workBottom = static_cast<int>(info.rcWork.bottom);
+        const int windowX = std::clamp(centerX - windowWidth / 2, workLeft,
+                                       std::max(workLeft, workRight - windowWidth));
+        const int windowY = std::clamp(centerY - windowHeight / 2, workTop,
+                                       std::max(workTop, workBottom - windowHeight));
+        SetWindowPos(window_, nullptr, windowX, windowY, windowWidth, windowHeight,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        layoutControls();
+    }
+
+    HFONT createAppFont(int designHeight, int minimumHeight, int weight) const {
+        const int height = std::max(minimumHeight, scaled(designHeight));
+        return CreateFontW(-height, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH,
+                           L"Microsoft YaHei UI");
+    }
+
+    void applyFontsToControls() {
+        for (HWND control :
+             {title_,          subtitle_,       languageCombo_, themeButton_,     typeLabel_,
+              typeCombo_,      angleUnitButton_, hint_,          inputLabel_,      inputFrame_,
+              input_,          syntaxTitle_,     syntax_,        exampleButton_,   clearButton_,
+              solveButton_,    resultTitle_,     graphButton_,   historyButton_,   resultSummary_,
+              approximation_,  methodLabel_,     methodButtons_[0], methodButtons_[1],
+              methodButtons_[2], process_}) {
+            if (control)
+                SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(normalFont_), TRUE);
+        }
+        if (title_)
+            SendMessageW(title_, WM_SETFONT, reinterpret_cast<WPARAM>(titleFont_), TRUE);
+        for (HWND control : {subtitle_, languageCombo_, typeLabel_, typeCombo_, angleUnitButton_, hint_,
+                             syntax_, graphButton_, historyButton_, approximation_, methodLabel_}) {
+            if (control)
+                SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont_), TRUE);
+        }
+        if (logEdit_)
+            SendMessageW(logEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(normalFont_), TRUE);
+        if (logClearButton_)
+            SendMessageW(logClearButton_, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont_), TRUE);
+        if (graphCanvas_)
+            SendMessageW(graphCanvas_, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont_), TRUE);
+        if (dropdownList_)
+            SendMessageW(dropdownList_, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont_), TRUE);
+    }
+
+    void recreateFonts() {
+        HFONT previousNormal = normalFont_;
+        HFONT previousTitle = titleFont_;
+        HFONT previousSmall = smallFont_;
+        normalFont_ = createAppFont(17, 12, FW_NORMAL);
+        titleFont_ = createAppFont(27, 19, FW_BOLD);
+        smallFont_ = createAppFont(15, 11, FW_NORMAL);
+        applyFontsToControls();
+        if (previousNormal)
+            DeleteObject(previousNormal);
+        if (previousTitle)
+            DeleteObject(previousTitle);
+        if (previousSmall)
+            DeleteObject(previousSmall);
+    }
+
     HWND makeControl(const wchar_t* className, const wchar_t* text, DWORD style, int id = 0,
                      DWORD extendedStyle = 0) {
         HWND control =
@@ -1507,15 +1647,7 @@ class SolverApp {
     }
 
     void createControls() {
-        normalFont_ =
-            CreateFontW(-17, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
-        titleFont_ =
-            CreateFontW(-27, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
-        smallFont_ =
-            CreateFontW(-15, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+        recreateFonts();
 
         title_ = makeControl(L"STATIC", L"方程求解器", SS_LEFT);
         SendMessageW(title_, WM_SETFONT, reinterpret_cast<WPARAM>(titleFont_), TRUE);
@@ -1714,8 +1846,8 @@ class SolverApp {
             updateHistoryWindow();
             return;
         }
-        constexpr int logWidth = 680;
-        constexpr int logHeight = 560;
+        const int logWidth = scaled(680);
+        const int logHeight = scaled(560);
         RECT ownerRect{};
         GetWindowRect(window_, &ownerRect);
         const int logX = ownerRect.left + ((ownerRect.right - ownerRect.left) - logWidth) / 2;
@@ -1728,13 +1860,14 @@ class SolverApp {
             return;
         logEdit_ = CreateWindowExW(
             0, mathview::kClassName, L"",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | mathview::kVerticalScroll | mathview::kClickableLines, 16,
-            16, 632, 440, logWindow_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLogEditId)), instance_,
-            nullptr);
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | mathview::kVerticalScroll | mathview::kClickableLines,
+            scaled(16), scaled(16), scaled(632), scaled(440), logWindow_,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLogEditId)), instance_, nullptr);
         logClearButton_ = CreateWindowExW(
             0, L"BUTTON", localize(L"清空日志", L"Clear History").c_str(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 16, 470, 130, 36, logWindow_,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLogClearButtonId)), instance_, nullptr);
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, scaled(16), scaled(470), scaled(130),
+            scaled(36), logWindow_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLogClearButtonId)),
+            instance_, nullptr);
         SendMessageW(logEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(normalFont_), TRUE);
         SendMessageW(logClearButton_, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont_), TRUE);
         updateHistoryWindow();
@@ -1834,8 +1967,8 @@ class SolverApp {
             SetForegroundWindow(graphWindow_);
             return;
         }
-        constexpr int graphWidth = 860;
-        constexpr int graphHeight = 640;
+        const int graphWidth = scaled(860);
+        const int graphHeight = scaled(640);
         RECT owner{};
         GetWindowRect(window_, &owner);
         const int x = owner.left + ((owner.right - owner.left) - graphWidth) / 2;
@@ -1846,12 +1979,14 @@ class SolverApp {
         if (!graphWindow_)
             return;
         graphCanvas_ =
-            CreateWindowExW(0, graphview::kClassName, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 14, 14,
-                            graphWidth - 56, graphHeight - 78, graphWindow_, nullptr, instance_, nullptr);
+            CreateWindowExW(0, graphview::kClassName, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP, scaled(14),
+                            scaled(14), graphWidth - scaled(56), graphHeight - scaled(78), graphWindow_,
+                            nullptr, instance_, nullptr);
         SendMessageW(graphCanvas_, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont_), TRUE);
         RECT client{};
         GetClientRect(graphWindow_, &client);
-        MoveWindow(graphCanvas_, 14, 14, client.right - 28, client.bottom - 28, TRUE);
+        MoveWindow(graphCanvas_, scaled(14), scaled(14), client.right - scaled(28),
+                   client.bottom - scaled(28), TRUE);
         updateGraphView();
         applyGraphTheme();
         ShowWindow(graphWindow_, SW_SHOW);
@@ -1879,18 +2014,18 @@ class SolverApp {
         RECT anchorRect{};
         GetWindowRect(anchor, &anchorRect);
         const int anchorWidth = anchorRect.right - anchorRect.left;
-        const int width = std::max(anchorWidth, kind == DropdownKind::Type ? 210 : anchorWidth);
-        constexpr int rowHeight = 36;
+        const int width = std::max(anchorWidth, kind == DropdownKind::Type ? scaled(210) : anchorWidth);
+        const int rowHeight = scaled(36);
         const int visibleRows = std::min(8, static_cast<int>(items.size()));
-        const int height = visibleRows * rowHeight + 4;
+        const int height = visibleRows * rowHeight + scaled(4);
         MONITORINFO monitor{};
         monitor.cbSize = sizeof(monitor);
         GetMonitorInfoW(MonitorFromRect(&anchorRect, MONITOR_DEFAULTTONEAREST), &monitor);
         int x = std::clamp(anchorRect.left, monitor.rcWork.left,
                            std::max(monitor.rcWork.left, monitor.rcWork.right - width));
-        int y = anchorRect.bottom + 2;
+        int y = anchorRect.bottom + scaled(2);
         if (y + height > monitor.rcWork.bottom)
-            y = anchorRect.top - height - 2;
+            y = anchorRect.top - height - scaled(2);
 
         dropdownKind_ = kind;
         dropdownItems_ = items;
@@ -1907,11 +2042,11 @@ class SolverApp {
         }
         dropdownVisibleRows_ = visibleRows;
         const int scrollbarWidth =
-            static_cast<int>(items.size()) > visibleRows ? kDropdownScrollbarWidth : 0;
+            static_cast<int>(items.size()) > visibleRows ? scaled(kDropdownScrollbarWidth) : 0;
         dropdownList_ = CreateWindowExW(
             0, L"LISTBOX", L"",
             WS_CHILD | WS_VISIBLE | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT,
-            2, 2, width - 4 - scrollbarWidth, height - 4, dropdownWindow_,
+            scaled(2), scaled(2), width - scaled(4) - scrollbarWidth, height - scaled(4), dropdownWindow_,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDropdownListId)), instance_, nullptr);
         SendMessageW(dropdownList_, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont_), TRUE);
         SendMessageW(dropdownList_, LB_SETITEMHEIGHT, 0, rowHeight);
@@ -1920,7 +2055,8 @@ class SolverApp {
         SendMessageW(dropdownList_, LB_SETCURSEL, dropdownSelectedIndex_, 0);
         SendMessageW(dropdownList_, LB_SETTOPINDEX, std::max(0, dropdownSelectedIndex_ - visibleRows / 2), 0);
         SetWindowSubclass(dropdownList_, DropdownListProc, 1, reinterpret_cast<DWORD_PTR>(this));
-        HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1, 10, 10);
+        HRGN region =
+            CreateRoundRectRgn(0, 0, width + 1, height + 1, scaled(10), scaled(10));
         SetWindowRgn(dropdownWindow_, region, TRUE);
         ShowWindow(dropdownWindow_, SW_SHOWNORMAL);
         SetFocus(dropdownList_);
@@ -1951,26 +2087,28 @@ class SolverApp {
     RECT dropdownScrollbarRect(HWND hwnd) const {
         RECT client{};
         GetClientRect(hwnd, &client);
-        return {client.right - kDropdownScrollbarWidth - 2, 2, client.right - 2, client.bottom - 2};
+        return {client.right - scaled(kDropdownScrollbarWidth) - scaled(2), scaled(2),
+                client.right - scaled(2), client.bottom - scaled(2)};
     }
 
     RECT dropdownThumbRect(HWND hwnd) const {
         const RECT bar = dropdownScrollbarRect(hwnd);
+        const int arrowHeight = scaled(kDropdownArrowHeight);
         const int trackHeight =
-            std::max(1, static_cast<int>(bar.bottom - bar.top) - 2 * kDropdownArrowHeight);
+            std::max(1, static_cast<int>(bar.bottom - bar.top) - 2 * arrowHeight);
         const int maximum = dropdownMaxTopIndex();
         const int thumbHeight =
             maximum == 0
                 ? trackHeight
-                : std::max(kDropdownMinimumThumbHeight,
+                : std::max(scaled(kDropdownMinimumThumbHeight),
                            trackHeight * dropdownVisibleRows_ /
                                std::max(1, static_cast<int>(dropdownItems_.size())));
         const int travel = std::max(0, trackHeight - thumbHeight);
         const int topIndex =
             dropdownList_ ? static_cast<int>(SendMessageW(dropdownList_, LB_GETTOPINDEX, 0, 0)) : 0;
         const int thumbTop =
-            bar.top + kDropdownArrowHeight + (maximum == 0 ? 0 : travel * topIndex / maximum);
-        return {bar.right - 12, thumbTop, bar.right - 4, thumbTop + thumbHeight};
+            bar.top + arrowHeight + (maximum == 0 ? 0 : travel * topIndex / maximum);
+        return {bar.right - scaled(12), thumbTop, bar.right - scaled(4), thumbTop + thumbHeight};
     }
 
     void drawDropdownScrollbar(HWND hwnd, HDC dc) const {
@@ -1987,14 +2125,16 @@ class SolverApp {
         HGDIOBJ oldPen = SelectObject(dc, pen);
         HGDIOBJ oldBrush = SelectObject(dc, brush);
         const int centerX = bar.left + (bar.right - bar.left) / 2;
-        POINT up[]{{centerX, bar.top + 4}, {centerX - 4, bar.top + 10}, {centerX + 4, bar.top + 10}};
-        POINT down[]{{centerX - 4, bar.bottom - 10},
-                     {centerX + 4, bar.bottom - 10},
-                     {centerX, bar.bottom - 4}};
+        POINT up[]{{centerX, bar.top + scaled(4)},
+                   {centerX - scaled(4), bar.top + scaled(10)},
+                   {centerX + scaled(4), bar.top + scaled(10)}};
+        POINT down[]{{centerX - scaled(4), bar.bottom - scaled(10)},
+                     {centerX + scaled(4), bar.bottom - scaled(10)},
+                     {centerX, bar.bottom - scaled(4)}};
         Polygon(dc, up, 3);
         Polygon(dc, down, 3);
         const RECT thumb = dropdownThumbRect(hwnd);
-        RoundRect(dc, thumb.left, thumb.top, thumb.right, thumb.bottom, 8, 8);
+        RoundRect(dc, thumb.left, thumb.top, thumb.right, thumb.bottom, scaled(8), scaled(8));
         SelectObject(dc, oldBrush);
         SelectObject(dc, oldPen);
         DeleteObject(brush);
@@ -2347,38 +2487,47 @@ class SolverApp {
         GetClientRect(window_, &client);
         const int width = static_cast<int>(client.right);
         const int height = static_cast<int>(client.bottom);
-        const int margin = 28;
+        const int margin = scaled(28);
         SetWindowTextW(resultSummary_, localizedSolverOutput(lastSummaryZh_).c_str());
         const int naturalSummaryWidth = mathview::preferredWidth(resultSummary_);
-        const int regularLeftWidth = std::clamp(width * 38 / 100, 350, 460);
+        const int regularLeftWidth = std::clamp(width * 38 / 100, scaled(350), scaled(460));
         // Keep the two-column divider stable while the answer changes.  The result card below still
         // grows to the available right-column width and wraps long exact answers, but it must not
         // move the input controls or leave stale scrollbar/button fragments at their former positions.
         const int leftWidth = regularLeftWidth;
-        const int rightX = margin + leftWidth + 24;
-        const int rightWidth = std::max(320, width - rightX - margin);
+        const int rightX = margin + leftWidth + scaled(24);
+        const int rightWidth = std::max(scaled(320), width - rightX - margin);
 
-        MoveWindow(title_, margin, 20, 520, 38, TRUE);
-        MoveWindow(subtitle_, margin, 58, std::max(280, width - 2 * margin - 245), 23, TRUE);
-        MoveWindow(languageCombo_, width - margin - 210, 24, 138, 34, TRUE);
-        MoveWindow(themeButton_, width - margin - 62, 26, 62, 30, TRUE);
-        MoveWindow(typeLabel_, margin, 101, 70, 25, TRUE);
-        MoveWindow(typeCombo_, margin + 72, 96, std::max(130, leftWidth - 218), 34, TRUE);
-        MoveWindow(angleUnitButton_, margin + leftWidth - 134, 96, 134, 34, TRUE);
-        MoveWindow(hint_, margin, 136, leftWidth, 24, TRUE);
-        MoveWindow(inputLabel_, margin, 171, leftWidth, 24, TRUE);
-        MoveWindow(inputFrame_, margin, 198, leftWidth, 156, TRUE);
-        MoveWindow(input_, margin + 8, 205, leftWidth - 16, 142, TRUE);
-        MoveWindow(syntaxTitle_, margin, 376, leftWidth, 24, TRUE);
-        const int buttonY = height - 62;
-        MoveWindow(syntax_, margin, 403, leftWidth, std::max(122, buttonY - 415), TRUE);
-        MoveWindow(exampleButton_, margin, buttonY, 116, 36, TRUE);
-        MoveWindow(clearButton_, margin + 128, buttonY, 90, 36, TRUE);
-        MoveWindow(solveButton_, margin + 232, buttonY, std::max(118, leftWidth - 232), 36, TRUE);
+        MoveWindow(title_, margin, scaled(20), scaled(520), scaled(38), TRUE);
+        MoveWindow(subtitle_, margin, scaled(58),
+                   std::max(scaled(280), width - 2 * margin - scaled(245)), scaled(23), TRUE);
+        MoveWindow(languageCombo_, width - margin - scaled(210), scaled(24), scaled(138), scaled(34),
+                   TRUE);
+        MoveWindow(themeButton_, width - margin - scaled(62), scaled(26), scaled(62), scaled(30), TRUE);
+        MoveWindow(typeLabel_, margin, scaled(101), scaled(70), scaled(25), TRUE);
+        MoveWindow(typeCombo_, margin + scaled(72), scaled(96),
+                   std::max(scaled(130), leftWidth - scaled(218)), scaled(34), TRUE);
+        MoveWindow(angleUnitButton_, margin + leftWidth - scaled(134), scaled(96), scaled(134),
+                   scaled(34), TRUE);
+        MoveWindow(hint_, margin, scaled(136), leftWidth, scaled(24), TRUE);
+        MoveWindow(inputLabel_, margin, scaled(171), leftWidth, scaled(24), TRUE);
+        MoveWindow(inputFrame_, margin, scaled(198), leftWidth, scaled(156), TRUE);
+        MoveWindow(input_, margin + scaled(8), scaled(205), leftWidth - scaled(16), scaled(142), TRUE);
+        MoveWindow(syntaxTitle_, margin, scaled(376), leftWidth, scaled(24), TRUE);
+        const int buttonY = height - scaled(62);
+        MoveWindow(syntax_, margin, scaled(403), leftWidth,
+                   std::max(scaled(122), buttonY - scaled(415)), TRUE);
+        MoveWindow(exampleButton_, margin, buttonY, scaled(116), scaled(36), TRUE);
+        MoveWindow(clearButton_, margin + scaled(128), buttonY, scaled(90), scaled(36), TRUE);
+        MoveWindow(solveButton_, margin + scaled(232), buttonY,
+                   std::max(scaled(118), leftWidth - scaled(232)), scaled(36), TRUE);
 
-        MoveWindow(resultTitle_, rightX, 101, std::max(90, rightWidth - 240), 27, TRUE);
-        MoveWindow(graphButton_, rightX + rightWidth - 226, 94, 100, 34, TRUE);
-        MoveWindow(historyButton_, rightX + rightWidth - 118, 94, 118, 34, TRUE);
+        MoveWindow(resultTitle_, rightX, scaled(101), std::max(scaled(90), rightWidth - scaled(240)),
+                   scaled(27), TRUE);
+        MoveWindow(graphButton_, rightX + rightWidth - scaled(226), scaled(94), scaled(100), scaled(34),
+                   TRUE);
+        MoveWindow(historyButton_, rightX + rightWidth - scaled(118), scaled(94), scaled(118),
+                   scaled(34), TRUE);
         std::wstring displayedSummary = localizedSolverOutput(lastSummaryZh_);
         bool twoLineSummary = naturalSummaryWidth > rightWidth;
         if (twoLineSummary) {
@@ -2390,28 +2539,33 @@ class SolverApp {
         const int maxSummaryLines = expandedExactSummary ? 6 : 2;
         mathview::setMaxVisualLines(resultSummary_, maxSummaryLines);
         const int formattedWidth = mathview::preferredWidth(resultSummary_);
-        const int summaryWidth = twoLineSummary ? rightWidth : std::clamp(formattedWidth, 250, rightWidth);
+        const int summaryWidth =
+            twoLineSummary ? rightWidth : std::clamp(formattedWidth, scaled(250), rightWidth);
         const int summaryHeight =
-            std::max(62, mathview::requiredHeight(resultSummary_, summaryWidth, maxSummaryLines));
-        MoveWindow(resultSummary_, rightX, 135, summaryWidth, summaryHeight, TRUE);
+            std::max(scaled(62), mathview::requiredHeight(resultSummary_, summaryWidth, maxSummaryLines));
+        MoveWindow(resultSummary_, rightX, scaled(135), summaryWidth, summaryHeight, TRUE);
         const bool multiple = methodSectionsZh_.size() > 1;
-        int processTop = 135 + summaryHeight + 8;
+        int processTop = scaled(135) + summaryHeight + scaled(8);
         if (!lastApproximationZh_.empty()) {
-            MoveWindow(approximation_, rightX + 4, processTop, rightWidth - 8, 24, TRUE);
-            processTop += 28;
+            MoveWindow(approximation_, rightX + scaled(4), processTop, rightWidth - scaled(8),
+                       scaled(24), TRUE);
+            processTop += scaled(28);
         }
         if (multiple) {
-            MoveWindow(methodLabel_, rightX + 4, processTop + 5, 62, 36, TRUE);
+            MoveWindow(methodLabel_, rightX + scaled(4), processTop + scaled(5), scaled(62), scaled(36),
+                       TRUE);
             for (int i = 0; i < 3; ++i)
-                MoveWindow(methodButtons_[i], rightX + 68 + i * 52, processTop, 42, 42, TRUE);
-            processTop += 50;
+                MoveWindow(methodButtons_[i], rightX + scaled(68 + i * 52), processTop, scaled(42),
+                           scaled(42), TRUE);
+            processTop += scaled(50);
         }
-        MoveWindow(process_, rightX, processTop, rightWidth, std::max(150, height - processTop - 26), TRUE);
+        MoveWindow(process_, rightX, processTop, rightWidth,
+                   std::max(scaled(150), height - processTop - scaled(26)), TRUE);
 
         for (HWND control :
              {typeCombo_, angleUnitButton_, languageCombo_, inputFrame_, exampleButton_, clearButton_,
               solveButton_, graphButton_, historyButton_, resultSummary_, process_})
-            roundControl(control, 18);
+            roundControl(control, scaled(18));
 
         // MoveWindow redraws each child, but it does not reliably erase every pixel that belonged to
         // the child's old rounded region.  Redrawing the parent and all children prevents ghost
@@ -2440,12 +2594,13 @@ class SolverApp {
                         diameterPath, 270.0f, 180.0f);
             path.CloseFigure();
             graphics.FillPath(&trackBrush, &path);
-            const int diameter = rect.bottom - 6;
-            const int left = darkMode_ ? rect.right - diameter - 3 : 3;
+            const int diameter = rect.bottom - scaled(6);
+            const int left =
+                darkMode_ ? rect.right - diameter - scaled(3) : scaled(3);
             Gdiplus::SolidBrush knobBrush(Gdiplus::Color(255, 255, 255, 255));
-            graphics.FillEllipse(&knobBrush, left, 3, diameter, diameter);
+            graphics.FillEllipse(&knobBrush, left, scaled(3), diameter, diameter);
             SetTextColor(dc, darkMode_ ? RGB(22, 134, 255) : RGB(105, 110, 118));
-            RECT glyph{left, 3, left + diameter, 3 + diameter};
+            RECT glyph{left, scaled(3), left + diameter, scaled(3) + diameter};
             DrawTextW(dc, darkMode_ ? L"☾" : L"☀", -1, &glyph, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             return;
         }
@@ -2478,11 +2633,13 @@ class SolverApp {
             } else if (focused || optionExpanded) {
                 border = RGB(63, 104, 238);
             }
-            const Gdiplus::REAL left = 1.0f;
-            const Gdiplus::REAL top = 1.0f;
-            const Gdiplus::REAL right = static_cast<Gdiplus::REAL>(rect.right - 2);
-            const Gdiplus::REAL bottom = static_cast<Gdiplus::REAL>(rect.bottom - 2);
-            const Gdiplus::REAL diameter = optionBox ? 8.0f : 18.0f;
+            const Gdiplus::REAL left = scaledReal(1.0);
+            const Gdiplus::REAL top = scaledReal(1.0);
+            const Gdiplus::REAL right =
+                static_cast<Gdiplus::REAL>(rect.right) - scaledReal(2.0);
+            const Gdiplus::REAL bottom =
+                static_cast<Gdiplus::REAL>(rect.bottom) - scaledReal(2.0);
+            const Gdiplus::REAL diameter = optionBox ? scaledReal(8.0) : scaledReal(18.0);
             Gdiplus::GraphicsPath path;
             path.AddArc(left, top, diameter, diameter, 180.0f, 90.0f);
             path.AddArc(right - diameter, top, diameter, diameter, 270.0f, 90.0f);
@@ -2500,15 +2657,15 @@ class SolverApp {
             GetWindowTextW(item.hwndItem, label, static_cast<int>(std::size(label)));
             SetTextColor(dc, foreground);
             if (optionBox) {
-                RECT textRect{rect.left + 12, rect.top, rect.right - 34, rect.bottom};
+                RECT textRect{rect.left + scaled(12), rect.top, rect.right - scaled(34), rect.bottom};
                 DrawTextW(dc, label, -1, &textRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-                RECT arrowRect{rect.right - 30, rect.top, rect.right - 8, rect.bottom};
+                RECT arrowRect{rect.right - scaled(30), rect.top, rect.right - scaled(8), rect.bottom};
                 const Gdiplus::REAL centerX =
                     static_cast<Gdiplus::REAL>(arrowRect.left + arrowRect.right) / 2.0f;
                 const Gdiplus::REAL centerY =
                     static_cast<Gdiplus::REAL>(arrowRect.top + arrowRect.bottom) / 2.0f;
-                constexpr Gdiplus::REAL halfWidth = 5.0f;
-                constexpr Gdiplus::REAL halfHeight = 3.5f;
+                const Gdiplus::REAL halfWidth = scaledReal(5.0);
+                const Gdiplus::REAL halfHeight = scaledReal(3.5);
                 Gdiplus::PointF arrow[3];
                 if (optionExpanded) {
                     arrow[0] = {centerX, centerY - halfHeight};
@@ -2535,8 +2692,9 @@ class SolverApp {
             selected ? RGB(255, 255, 255) : (darkMode_ ? RGB(232, 236, 242) : RGB(30, 34, 42));
         Gdiplus::SolidBrush circleBrush(
             Gdiplus::Color(255, GetRValue(fill), GetGValue(fill), GetBValue(fill)));
-        graphics.FillEllipse(&circleBrush, 1.5f, 1.5f, static_cast<Gdiplus::REAL>(rect.right - 3),
-                             static_cast<Gdiplus::REAL>(rect.bottom - 3));
+        graphics.FillEllipse(&circleBrush, scaledReal(1.5), scaledReal(1.5),
+                             static_cast<Gdiplus::REAL>(rect.right) - scaledReal(3.0),
+                             static_cast<Gdiplus::REAL>(rect.bottom) - scaledReal(3.0));
         SetTextColor(dc, foreground);
         const std::wstring number = std::to_wstring(index + 1);
         DrawTextW(dc, number.c_str(), -1, &rect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -2550,7 +2708,7 @@ class SolverApp {
         case WM_MEASUREITEM: {
             auto* measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
             if (measure && measure->CtlID == kDropdownListId) {
-                measure->itemHeight = 36;
+                measure->itemHeight = static_cast<UINT>(scaled(36));
                 return TRUE;
             }
             break;
@@ -2570,8 +2728,8 @@ class SolverApp {
             SetBkMode(item->hDC, TRANSPARENT);
             SetTextColor(item->hDC, darkMode_ ? RGB(242, 244, 248) : RGB(27, 36, 49));
             RECT textRect = item->rcItem;
-            textRect.left += 14;
-            textRect.right -= 10;
+            textRect.left += scaled(14);
+            textRect.right -= scaled(10);
             DrawTextW(item->hDC, label, -1, &textRect,
                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             return TRUE;
@@ -2599,10 +2757,10 @@ class SolverApp {
             FillRect(dc, &client, background);
             DeleteObject(background);
             drawDropdownScrollbar(hwnd, dc);
-            HPEN border = CreatePen(PS_SOLID, 2, RGB(39, 126, 255));
+            HPEN border = CreatePen(PS_SOLID, std::max(1, scaled(2)), RGB(39, 126, 255));
             HGDIOBJ oldPen = SelectObject(dc, border);
             HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-            RoundRect(dc, 0, 0, client.right, client.bottom, 10, 10);
+            RoundRect(dc, 0, 0, client.right, client.bottom, scaled(10), scaled(10));
             SelectObject(dc, oldBrush);
             SelectObject(dc, oldPen);
             DeleteObject(border);
@@ -2624,9 +2782,10 @@ class SolverApp {
             const int topIndex =
                 static_cast<int>(SendMessageW(dropdownList_, LB_GETTOPINDEX, 0, 0));
             const RECT thumb = dropdownThumbRect(hwnd);
-            if (point.y < bar.top + kDropdownArrowHeight)
+            const int arrowHeight = scaled(kDropdownArrowHeight);
+            if (point.y < bar.top + arrowHeight)
                 scrollDropdownTo(topIndex - 1);
-            else if (point.y >= bar.bottom - kDropdownArrowHeight)
+            else if (point.y >= bar.bottom - arrowHeight)
                 scrollDropdownTo(topIndex + 1);
             else if (PtInRect(&thumb, point)) {
                 dropdownScrollbarDragging_ = true;
@@ -2642,13 +2801,14 @@ class SolverApp {
             if (dropdownScrollbarDragging_) {
                 const RECT bar = dropdownScrollbarRect(hwnd);
                 const RECT thumb = dropdownThumbRect(hwnd);
+                const int arrowHeight = scaled(kDropdownArrowHeight);
                 const int trackHeight =
-                    std::max(1, static_cast<int>(bar.bottom - bar.top) - 2 * kDropdownArrowHeight);
+                    std::max(1, static_cast<int>(bar.bottom - bar.top) - 2 * arrowHeight);
                 const int travel = std::max(1, trackHeight - static_cast<int>(thumb.bottom - thumb.top));
                 const int mousePosition = static_cast<int>(GET_Y_LPARAM(lParam));
                 const int position =
                     std::clamp(mousePosition - dropdownScrollbarDragOffset_ - static_cast<int>(bar.top) -
-                                   kDropdownArrowHeight,
+                                   arrowHeight,
                                0, travel);
                 scrollDropdownTo(position * dropdownMaxTopIndex() / travel);
             }
@@ -2691,13 +2851,14 @@ class SolverApp {
                 return 0;
             RECT client{};
             GetClientRect(hwnd, &client);
-            MoveWindow(graphCanvas_, 14, 14, std::max(320L, client.right - 28),
-                       std::max(240L, client.bottom - 28), TRUE);
+            MoveWindow(graphCanvas_, scaled(14), scaled(14),
+                       std::max(static_cast<LONG>(scaled(320)), client.right - scaled(28)),
+                       std::max(static_cast<LONG>(scaled(240)), client.bottom - scaled(28)), TRUE);
             return 0;
         }
         case WM_GETMINMAXINFO: {
             auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
-            info->ptMinTrackSize = {640, 460};
+            info->ptMinTrackSize = {scaled(640), scaled(460)};
             return 0;
         }
         case WM_ERASEBKGND: {
@@ -2724,12 +2885,17 @@ class SolverApp {
                 return 0;
             RECT client{};
             GetClientRect(hwnd, &client);
-            const int width = std::max(320, static_cast<int>(client.right));
-            const int height = std::max(240, static_cast<int>(client.bottom));
-            MoveWindow(logEdit_, 16, 16, width - 32, height - 82, TRUE);
-            MoveWindow(logClearButton_, 16, height - 52, 138, 36, TRUE);
-            roundControl(logEdit_, 18);
-            roundControl(logClearButton_, 18);
+            const int width = std::max(scaled(320), static_cast<int>(client.right));
+            const int height = std::max(scaled(240), static_cast<int>(client.bottom));
+            MoveWindow(logEdit_, scaled(16), scaled(16), width - scaled(32), height - scaled(82), TRUE);
+            MoveWindow(logClearButton_, scaled(16), height - scaled(52), scaled(138), scaled(36), TRUE);
+            roundControl(logEdit_, scaled(18));
+            roundControl(logClearButton_, scaled(18));
+            return 0;
+        }
+        case WM_GETMINMAXINFO: {
+            auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
+            info->ptMinTrackSize = {scaled(540), scaled(420)};
             return 0;
         }
         case WM_ERASEBKGND: {
@@ -2796,6 +2962,42 @@ class SolverApp {
             closeDropdown();
             layoutControls();
             return 0;
+        case WM_DPICHANGED: {
+            const RECT suggested = *reinterpret_cast<RECT*>(lParam);
+            const HMONITOR monitor = MonitorFromRect(&suggested, MONITOR_DEFAULTTONEAREST);
+            const UINT dpi = HIWORD(wParam) ? HIWORD(wParam) : 96;
+            if (IsZoomed(window_)) {
+                updateDisplayScale(monitor, dpi, true);
+                SetWindowPos(window_, nullptr, suggested.left, suggested.top,
+                             suggested.right - suggested.left, suggested.bottom - suggested.top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+                layoutControls();
+            } else {
+                adaptWindowToMonitor(monitor, dpi, suggested);
+            }
+            return 0;
+        }
+        case WM_DISPLAYCHANGE: {
+            RECT current{};
+            GetWindowRect(window_, &current);
+            const HMONITOR monitor = MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST);
+            if (IsZoomed(window_)) {
+                updateDisplayScale(monitor, GetDpiForWindow(window_), true);
+                layoutControls();
+            } else {
+                adaptWindowToMonitor(monitor, GetDpiForWindow(window_), current);
+            }
+            return 0;
+        }
+        case WM_SETTINGCHANGE:
+            if (wParam == SPI_SETWORKAREA) {
+                RECT current{};
+                GetWindowRect(window_, &current);
+                const HMONITOR monitor = MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST);
+                if (!IsZoomed(window_))
+                    adaptWindowToMonitor(monitor, GetDpiForWindow(window_), current);
+            }
+            break;
         case WM_ERASEBKGND: {
             RECT client{};
             GetClientRect(window_, &client);
@@ -2804,7 +3006,7 @@ class SolverApp {
         }
         case WM_GETMINMAXINFO: {
             auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
-            info->ptMinTrackSize = {920, 650};
+            info->ptMinTrackSize = {scaled(920), scaled(650)};
             return 0;
         }
         case WM_DRAWITEM:
@@ -2876,6 +3078,8 @@ class SolverApp {
 
     HINSTANCE instance_{};
     HWND window_{};
+    double uiScale_ = 1.0;
+    UINT currentDpi_ = 96;
     HFONT normalFont_{};
     HFONT titleFont_{};
     HFONT smallFont_{};
