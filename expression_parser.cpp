@@ -87,6 +87,11 @@ ExactFraction operator-(const ExactFraction& left, const ExactFraction& right) {
             left.denominator * right.denominator};
 }
 
+ExactFraction operator+(const ExactFraction& left, const ExactFraction& right) {
+    return {left.numerator * right.denominator + right.numerator * left.denominator,
+            left.denominator * right.denominator};
+}
+
 ExactFraction operator*(const ExactFraction& left, const ExactFraction& right) {
     return {left.numerator * right.numerator, left.denominator * right.denominator};
 }
@@ -307,11 +312,61 @@ std::wstring symbolicNumber(double value) {
     return formatNumber(value);
 }
 
+struct ExactRootExpression {
+    ExactFraction rational;
+    ExactFraction radicalCoefficient;
+    std::int64_t radicand = 1;
+
+    double value() const {
+        return rational.value() + radicalCoefficient.value() * std::sqrt(static_cast<double>(radicand));
+    }
+
+    std::wstring text() const {
+        if (radicalCoefficient.isZero())
+            return rational.text();
+        if (radicand == 1)
+            return (rational + radicalCoefficient).text();
+
+        std::int64_t denominator = safeLcm(rational.denominator, radicalCoefficient.denominator);
+        std::int64_t rationalNumerator =
+            rational.numerator * (denominator / rational.denominator);
+        std::int64_t radicalNumerator =
+            radicalCoefficient.numerator * (denominator / radicalCoefficient.denominator);
+        std::int64_t divisor = std::gcd(std::abs(rationalNumerator), std::abs(radicalNumerator));
+        divisor = std::gcd(divisor, denominator);
+        if (divisor > 1) {
+            rationalNumerator /= divisor;
+            radicalNumerator /= divisor;
+            denominator /= divisor;
+        }
+
+        const std::int64_t radicalMagnitude = std::abs(radicalNumerator);
+        std::wstring radicalText;
+        if (radicalMagnitude != 1)
+            radicalText += std::to_wstring(radicalMagnitude);
+        radicalText += L"√" + std::to_wstring(radicand);
+
+        std::wstring numeratorText;
+        if (rationalNumerator == 0) {
+            numeratorText = radicalNumerator < 0 ? L"-" + radicalText : radicalText;
+        } else {
+            numeratorText = std::to_wstring(rationalNumerator) +
+                            (radicalNumerator < 0 ? L" - " : L" + ") + radicalText;
+        }
+        if (denominator == 1)
+            return numeratorText;
+        if (rationalNumerator == 0)
+            return numeratorText + L"/" + std::to_wstring(denominator);
+        return L"(" + numeratorText + L")/" + std::to_wstring(denominator);
+    }
+};
+
 struct ExactRootResult {
     bool available = false;
     bool hasRealRoots = true;
     std::vector<std::wstring> texts;
     std::vector<double> values;
+    std::vector<ExactRootExpression> expressions;
     std::wstring calculation;
 };
 
@@ -330,6 +385,7 @@ ExactRootResult exactRoots(double coefficientA, double coefficientB, double coef
         const ExactFraction root(-c, b);
         result.texts.push_back(root.text());
         result.values.push_back(root.value());
+        result.expressions.push_back({root, ExactFraction(0), 1});
         result.calculation = L"x = -c/b = " + root.text();
         return result;
     }
@@ -349,9 +405,11 @@ ExactRootResult exactRoots(double coefficientA, double coefficientB, double coef
         const ExactFraction second(-b - squareRoot, denominator);
         result.texts.push_back(first.text());
         result.values.push_back(first.value());
+        result.expressions.push_back({first, ExactFraction(0), 1});
         if (first.numerator != second.numerator || first.denominator != second.denominator) {
             result.texts.push_back(second.text());
             result.values.push_back(second.value());
+            result.expressions.push_back({second, ExactFraction(0), 1});
         }
         result.calculation += L"√Δ = " + std::to_wstring(squareRoot) + L"，代入求根公式并约分。";
         return result;
@@ -390,6 +448,11 @@ ExactRootResult exactRoots(double coefficientA, double coefficientB, double coef
     } else {
         const double root = std::sqrt(static_cast<double>(delta));
         result.values = {(-b + root) / denominator, (-b - root) / denominator};
+        result.expressions = {
+            {ExactFraction(constant, finalDenominator),
+             ExactFraction(outside, finalDenominator), inside},
+            {ExactFraction(constant, finalDenominator),
+             ExactFraction(-outside, finalDenominator), inside}};
     }
     result.calculation += L"化简根式后，代入 x = (-b ± √Δ)/(2a)。";
     return result;
@@ -2567,39 +2630,153 @@ void appendSystemPoint(std::vector<SystemPoint>& points, double x, double y) {
 }
 
 std::pair<std::wstring, bool> coordinateText(double value) {
-    std::wstring symbolic = symbolicNumber(value);
-    if (symbolic.find(L'.') != std::wstring::npos) {
-        const bool negative = value < 0.0;
-        const double magnitude = std::abs(value);
-        for (int degree = 2; degree <= 9 && symbolic.find(L'.') != std::wstring::npos; ++degree) {
-            const double powered = std::pow(magnitude, degree);
-            for (std::int64_t denominator = 1; denominator <= 1000; ++denominator) {
-                const auto numerator = static_cast<std::int64_t>(std::llround(powered * denominator));
-                if (numerator <= 0)
-                    continue;
-                const double recovered = static_cast<double>(numerator) / denominator;
-                if (std::abs(recovered - powered) >
-                    1e-8 * std::max({1.0, std::abs(recovered), std::abs(powered)})) {
-                    continue;
-                }
-                const ExactFraction recoveredPower(numerator, denominator);
-                if (degree == 2) {
-                    const auto squareRoot = exactSquareRootForm(recoveredPower);
-                    if (!squareRoot)
-                        continue;
-                    symbolic = squareRoot->text();
-                } else {
-                    symbolic = simplifiedNthRoot(recoveredPower, degree);
-                }
-                if (negative)
-                    symbolic = L"-" + symbolic;
-                break;
+    if (const auto fraction = rationalize(value))
+        return {fraction->text(), false};
+    return {approximateNumber(value), true};
+}
+
+struct ExactSystemPointText {
+    std::optional<std::wstring> x;
+    std::optional<std::wstring> y;
+};
+
+std::optional<ExactFraction> nearbySimpleFraction(double value) {
+    if (!std::isfinite(value))
+        return std::nullopt;
+    constexpr std::int64_t maxDenominator = 10000;
+    constexpr double tolerance = 1e-7;
+    for (std::int64_t denominator = 1; denominator <= maxDenominator; ++denominator) {
+        const long double scaled = static_cast<long double>(value) * denominator;
+        if (scaled > static_cast<long double>(std::numeric_limits<std::int64_t>::max()) ||
+            scaled < static_cast<long double>(std::numeric_limits<std::int64_t>::min())) {
+            return std::nullopt;
+        }
+        const auto numerator = static_cast<std::int64_t>(std::llround(scaled));
+        const double candidate = static_cast<double>(numerator) / denominator;
+        if (std::abs(candidate - value) <= tolerance * std::max(1.0, std::abs(value)))
+            return ExactFraction(numerator, denominator);
+    }
+    return std::nullopt;
+}
+
+bool verifiedRationalPoint(const Polynomial& polynomial, const ExactFraction& x,
+                           const ExactFraction& y) {
+    const long double xValue = static_cast<long double>(x.numerator) / x.denominator;
+    const long double yValue = static_cast<long double>(y.numerator) / y.denominator;
+    long double value = 0.0L;
+    long double scale = 1.0L;
+    for (const auto& [powers, coefficient] : polynomial.terms) {
+        const auto exactCoefficient = rationalize(coefficient);
+        if (!exactCoefficient)
+            return false;
+        long double term = static_cast<long double>(exactCoefficient->numerator) /
+                           exactCoefficient->denominator;
+        for (int power = 0; power < powers[0]; ++power)
+            term *= xValue;
+        for (int power = 0; power < powers[1]; ++power)
+            term *= yValue;
+        value += term;
+        scale += std::abs(term);
+    }
+    return std::abs(value) <= 1e-15L * scale;
+}
+
+void fillVerifiedRationalPointTexts(const std::array<Polynomial, 2>& equations,
+                                    const std::vector<SystemPoint>& points,
+                                    std::vector<ExactSystemPointText>& texts) {
+    for (size_t index = 0; index < points.size(); ++index) {
+        const auto x = nearbySimpleFraction(points[index].x);
+        const auto y = nearbySimpleFraction(points[index].y);
+        if (!x || !y || !verifiedRationalPoint(equations[0], *x, *y) ||
+            !verifiedRationalPoint(equations[1], *x, *y)) {
+            continue;
+        }
+        texts[index].x = x->text();
+        texts[index].y = y->text();
+    }
+}
+
+std::optional<Polynomial> linearRelationForY(const std::array<Polynomial, 2>& equations) {
+    for (const auto& equation : equations) {
+        if (equation.totalDegree() <= 1 && std::abs(equation.coefficient(0, 1)) >= kEpsilon)
+            return equation;
+    }
+
+    const std::array<Powers, 3> quadraticTerms{{{2, 0, 0}, {1, 1, 0}, {0, 2, 0}}};
+    for (const Powers& powers : quadraticTerms) {
+        const double firstCoefficient =
+            equations[0].coefficient(powers[0], powers[1], powers[2]);
+        const double secondCoefficient =
+            equations[1].coefficient(powers[0], powers[1], powers[2]);
+        if (std::abs(firstCoefficient) < kEpsilon || std::abs(secondCoefficient) < kEpsilon)
+            continue;
+        Polynomial relation =
+            add(multiply(Polynomial::constant(secondCoefficient), equations[0]),
+                multiply(Polynomial::constant(firstCoefficient), equations[1]), -1.0);
+        relation.clean();
+        if (relation.totalDegree() <= 1 && std::abs(relation.coefficient(0, 1)) >= kEpsilon)
+            return relation;
+    }
+    return std::nullopt;
+}
+
+std::vector<ExactSystemPointText> exactSystemPointTexts(
+    const UniPolynomial& resultant, const std::array<Polynomial, 2>& equations,
+    const std::vector<SystemPoint>& points) {
+    std::vector<ExactSystemPointText> texts(points.size());
+    if (resultant.empty() || resultant.size() > 3)
+        return texts;
+
+    const double a = resultant.size() > 2 ? static_cast<double>(resultant[2]) : 0.0;
+    const double b = resultant.size() > 1 ? static_cast<double>(resultant[1]) : 0.0;
+    const double c = static_cast<double>(resultant[0]);
+    const ExactRootResult roots = exactRoots(a, b, c);
+    if (!roots.available || !roots.hasRealRoots || roots.expressions.empty())
+        return texts;
+
+    std::optional<ExactFraction> xScale;
+    std::optional<ExactFraction> constant;
+    if (const auto relation = linearRelationForY(equations)) {
+        const auto xCoefficient = rationalize(relation->coefficient(1, 0));
+        const auto yCoefficient = rationalize(relation->coefficient(0, 1));
+        const auto constantCoefficient = rationalize(relation->coefficient(0, 0));
+        if (xCoefficient && yCoefficient && constantCoefficient && !yCoefficient->isZero()) {
+            const ExactFraction negativeX(-xCoefficient->numerator, xCoefficient->denominator);
+            const ExactFraction negativeConstant(-constantCoefficient->numerator,
+                                                 constantCoefficient->denominator);
+            xScale = negativeX / *yCoefficient;
+            constant = negativeConstant / *yCoefficient;
+        }
+    }
+
+    for (size_t pointIndex = 0; pointIndex < points.size(); ++pointIndex) {
+        const ExactRootExpression* closest = nullptr;
+        double closestDistance = std::numeric_limits<double>::infinity();
+        for (const ExactRootExpression& expression : roots.expressions) {
+            const double distance = std::abs(expression.value() - points[pointIndex].x);
+            if (distance < closestDistance) {
+                closestDistance = distance;
+                closest = &expression;
+            }
+        }
+        if (!closest || closestDistance >
+                            1e-7 * std::max(1.0, std::abs(points[pointIndex].x))) {
+            continue;
+        }
+
+        texts[pointIndex].x = closest->text();
+        if (xScale && constant) {
+            ExactRootExpression yExpression;
+            yExpression.rational = *xScale * closest->rational + *constant;
+            yExpression.radicalCoefficient = *xScale * closest->radicalCoefficient;
+            yExpression.radicand = closest->radicand;
+            if (std::abs(yExpression.value() - points[pointIndex].y) <=
+                1e-7 * std::max(1.0, std::abs(points[pointIndex].y))) {
+                texts[pointIndex].y = yExpression.text();
             }
         }
     }
-    if (symbolic.find(L'.') == std::wstring::npos)
-        return {symbolic, false};
-    return {approximateNumber(value), true};
+    return texts;
 }
 
 SolveResult solveQuadraticSystem(const std::vector<std::wstring>& lines, AngleUnit angleUnit) {
@@ -2642,8 +2819,29 @@ SolveResult solveQuadraticSystem(const std::vector<std::wstring>& lines, AngleUn
                                L"\r\n\r\n消元所得结式恒为 0，两个方程存在公共因式或公共曲线。";
         return {L"结论：方程组有无穷多个实数解", process};
     }
-    std::vector<long double> resultantCoefficients = resultant;
-    const std::vector<long double> xRoots = realPolynomialRoots(std::move(resultantCoefficients));
+    std::vector<long double> xRoots;
+    if (resultant.size() <= 3) {
+        const double a = resultant.size() > 2 ? static_cast<double>(resultant[2]) : 0.0;
+        const double b = resultant.size() > 1 ? static_cast<double>(resultant[1]) : 0.0;
+        const ExactRootResult exactResultantRoots =
+            exactRoots(a, b, static_cast<double>(resultant[0]));
+        if (exactResultantRoots.available && exactResultantRoots.hasRealRoots &&
+            !exactResultantRoots.expressions.empty()) {
+            for (const ExactRootExpression& root : exactResultantRoots.expressions) {
+                const long double rational = static_cast<long double>(root.rational.numerator) /
+                                             root.rational.denominator;
+                const long double radical =
+                    static_cast<long double>(root.radicalCoefficient.numerator) /
+                    root.radicalCoefficient.denominator *
+                    std::sqrt(static_cast<long double>(root.radicand));
+                xRoots.push_back(rational + radical);
+            }
+        }
+    }
+    if (xRoots.empty()) {
+        std::vector<long double> resultantCoefficients = resultant;
+        xRoots = realPolynomialRoots(std::move(resultantCoefficients));
+    }
     std::vector<SystemPoint> points;
     bool hasVerticalFamily = false;
     for (const long double xRoot : xRoots) {
@@ -2676,15 +2874,21 @@ SolveResult solveQuadraticSystem(const std::vector<std::wstring>& lines, AngleUn
             return left.x < right.x;
         return left.y < right.y;
     });
+    std::vector<ExactSystemPointText> exactCoordinates =
+        exactSystemPointTexts(resultant, equations, points);
+    fillVerifiedRationalPointTexts(equations, points, exactCoordinates);
     std::wstring summary = L"实数解：";
     for (size_t i = 0; i < points.size(); ++i) {
         if (i)
             summary += L"；";
-        const auto [xText, xApproximate] = coordinateText(points[i].x);
-        const auto [yText, yApproximate] = coordinateText(points[i].y);
+        const auto [fallbackXText, xApproximate] = coordinateText(points[i].x);
+        const auto [fallbackYText, yApproximate] = coordinateText(points[i].y);
+        const std::wstring xText = exactCoordinates[i].x.value_or(fallbackXText);
+        const std::wstring yText = exactCoordinates[i].y.value_or(fallbackYText);
         const std::wstring suffix = points.size() > 1 ? subscriptNumber(i + 1) : L"";
-        summary += L"x" + suffix + (xApproximate ? L" ≈ " : L" = ") + xText + L"，y" + suffix +
-                   (yApproximate ? L" ≈ " : L" = ") + yText;
+        summary += L"x" + suffix + (exactCoordinates[i].x || !xApproximate ? L" = " : L" ≈ ") +
+                   xText + L"，y" + suffix +
+                   (exactCoordinates[i].y || !yApproximate ? L" = " : L" ≈ ") + yText;
     }
 
     Polynomial reducedRelation;
@@ -2727,10 +2931,14 @@ SolveResult solveQuadraticSystem(const std::vector<std::wstring>& lines, AngleUn
         process << L"选择只在一个方程中出现的二次项，从另一个方程解出较简单的关系并代入。\r\n";
     }
     for (size_t i = 0; i < points.size(); ++i) {
-        const auto [xText, xApproximate] = coordinateText(points[i].x);
-        const auto [yText, yApproximate] = coordinateText(points[i].y);
-        process << L"第 " << i + 1 << L" 组：取 x " << (xApproximate ? L"≈ " : L"= ") << xText
-                << L"，代入降次关系及 (1)，解得 y " << (yApproximate ? L"≈ " : L"= ") << yText
+        const auto [fallbackXText, xApproximate] = coordinateText(points[i].x);
+        const auto [fallbackYText, yApproximate] = coordinateText(points[i].y);
+        const std::wstring xText = exactCoordinates[i].x.value_or(fallbackXText);
+        const std::wstring yText = exactCoordinates[i].y.value_or(fallbackYText);
+        process << L"第 " << i + 1 << L" 组：取 x "
+                << (exactCoordinates[i].x || !xApproximate ? L"= " : L"≈ ") << xText
+                << L"，代入降次关系及 (1)，解得 y "
+                << (exactCoordinates[i].y || !yApproximate ? L"= " : L"≈ ") << yText
                 << L"。\r\n"
                 << L"验算第 " << i + 1 << L" 组解：代入两个原方程，左右两边均相等。\r\n";
     }
