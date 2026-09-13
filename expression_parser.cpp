@@ -29,6 +29,36 @@ constexpr double kPi = 3.141592653589793238462643383279502884;
 constexpr double kEuler = 2.718281828459045235360287471352662498;
 using Powers = std::array<int, 3>;
 
+// Roots are grouped for presentation: exact integers first, then positive non-integers, then
+// negative non-integers. Comparators may add their previous numeric ordering as a tie-breaker so
+// existing ordering remains stable inside each group.
+int realRootPriority(double value) {
+    const double tolerance = 1e-8 * std::clamp(std::abs(value), 1.0, 10000.0);
+    if (std::abs(value - std::round(value)) <= tolerance)
+        return 0;
+    return value > 0.0 ? 1 : 2;
+}
+
+void sortRootValueTextPairs(std::vector<double>& values, std::vector<std::wstring>& texts) {
+    if (values.size() != texts.size() || values.size() < 2)
+        return;
+    std::vector<size_t> order(values.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](size_t left, size_t right) {
+        return realRootPriority(values[left]) < realRootPriority(values[right]);
+    });
+    std::vector<double> sortedValues;
+    std::vector<std::wstring> sortedTexts;
+    sortedValues.reserve(values.size());
+    sortedTexts.reserve(texts.size());
+    for (const size_t index : order) {
+        sortedValues.push_back(values[index]);
+        sortedTexts.push_back(std::move(texts[index]));
+    }
+    values = std::move(sortedValues);
+    texts = std::move(sortedTexts);
+}
+
 std::wstring approximateNumber(double value) {
     if (std::abs(value) < 0.0005)
         value = 0.0;
@@ -328,8 +358,7 @@ struct ExactRootExpression {
             return (rational + radicalCoefficient).text();
 
         std::int64_t denominator = safeLcm(rational.denominator, radicalCoefficient.denominator);
-        std::int64_t rationalNumerator =
-            rational.numerator * (denominator / rational.denominator);
+        std::int64_t rationalNumerator = rational.numerator * (denominator / rational.denominator);
         std::int64_t radicalNumerator =
             radicalCoefficient.numerator * (denominator / radicalCoefficient.denominator);
         std::int64_t divisor = std::gcd(std::abs(rationalNumerator), std::abs(radicalNumerator));
@@ -350,8 +379,8 @@ struct ExactRootExpression {
         if (rationalNumerator == 0) {
             numeratorText = radicalNumerator < 0 ? L"-" + radicalText : radicalText;
         } else {
-            numeratorText = std::to_wstring(rationalNumerator) +
-                            (radicalNumerator < 0 ? L" - " : L" + ") + radicalText;
+            numeratorText =
+                std::to_wstring(rationalNumerator) + (radicalNumerator < 0 ? L" - " : L" + ") + radicalText;
         }
         if (denominator == 1)
             return numeratorText;
@@ -369,6 +398,32 @@ struct ExactRootResult {
     std::vector<ExactRootExpression> expressions;
     std::wstring calculation;
 };
+
+void sortExactRealRoots(ExactRootResult& result) {
+    if (!result.hasRealRoots || result.values.size() != result.texts.size() ||
+        result.values.size() != result.expressions.size() || result.values.size() < 2) {
+        return;
+    }
+    std::vector<size_t> order(result.values.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](size_t left, size_t right) {
+        return realRootPriority(result.values[left]) < realRootPriority(result.values[right]);
+    });
+    std::vector<double> values;
+    std::vector<std::wstring> texts;
+    std::vector<ExactRootExpression> expressions;
+    values.reserve(order.size());
+    texts.reserve(order.size());
+    expressions.reserve(order.size());
+    for (const size_t index : order) {
+        values.push_back(result.values[index]);
+        texts.push_back(std::move(result.texts[index]));
+        expressions.push_back(result.expressions[index]);
+    }
+    result.values = std::move(values);
+    result.texts = std::move(texts);
+    result.expressions = std::move(expressions);
+}
 
 ExactRootResult exactRoots(double coefficientA, double coefficientB, double coefficientC) {
     const auto integer = toIntegerEquation({coefficientA, coefficientB, coefficientC, 0.0});
@@ -412,6 +467,7 @@ ExactRootResult exactRoots(double coefficientA, double coefficientB, double coef
             result.expressions.push_back({second, ExactFraction(0), 1});
         }
         result.calculation += L"√Δ = " + std::to_wstring(squareRoot) + L"，代入求根公式并约分。";
+        sortExactRealRoots(result);
         return result;
     }
 
@@ -449,12 +505,11 @@ ExactRootResult exactRoots(double coefficientA, double coefficientB, double coef
         const double root = std::sqrt(static_cast<double>(delta));
         result.values = {(-b + root) / denominator, (-b - root) / denominator};
         result.expressions = {
-            {ExactFraction(constant, finalDenominator),
-             ExactFraction(outside, finalDenominator), inside},
-            {ExactFraction(constant, finalDenominator),
-             ExactFraction(-outside, finalDenominator), inside}};
+            {ExactFraction(constant, finalDenominator), ExactFraction(outside, finalDenominator), inside},
+            {ExactFraction(constant, finalDenominator), ExactFraction(-outside, finalDenominator), inside}};
     }
     result.calculation += L"化简根式后，代入 x = (-b ± √Δ)/(2a)。";
+    sortExactRealRoots(result);
     return result;
 }
 
@@ -1713,11 +1768,102 @@ std::wstring coefficientPolynomialText(const std::vector<double>& coefficients) 
     return polynomialText(polynomial);
 }
 
+std::wstring integerListText(const std::vector<std::int64_t>& values) {
+    std::wstring result;
+    for (size_t index = 0; index < values.size(); ++index) {
+        if (index)
+            result += L"、";
+        result += std::to_wstring(values[index]);
+    }
+    return result.empty() ? L"无" : result;
+}
+
+std::wstring coefficientListText(const std::vector<double>& coefficients) {
+    std::wstring result;
+    for (size_t index = coefficients.size(); index-- > 0;) {
+        if (!result.empty())
+            result += L"，";
+        result += symbolicNumber(coefficients[index]);
+    }
+    return result;
+}
+
+std::wstring linearFactorText(const ExactFraction& root) {
+    if (root.isZero())
+        return L"x";
+    const ExactFraction magnitude(std::abs(root.numerator), root.denominator);
+    return root.numerator < 0 ? L"(x + " + magnitude.text() + L")" : L"(x - " + magnitude.text() + L")";
+}
+
+std::wstring substitutedPolynomialText(const std::vector<double>& coefficients, const ExactFraction& root) {
+    std::wstring result;
+    for (size_t power = coefficients.size(); power-- > 0;) {
+        const double coefficient = coefficients[power];
+        if (std::abs(coefficient) < kEpsilon)
+            continue;
+        const bool negative = coefficient < 0.0;
+        const double magnitude = std::abs(coefficient);
+        if (result.empty()) {
+            if (negative)
+                result += L"-";
+        } else {
+            result += negative ? L" - " : L" + ";
+        }
+        if (power == 0 || std::abs(magnitude - 1.0) > kEpsilon) {
+            result += symbolicNumber(magnitude);
+            if (power > 0)
+                result += L" × ";
+        }
+        if (power > 0) {
+            result += L"(" + root.text() + L")";
+            if (power > 1)
+                result += L"^" + std::to_wstring(power);
+        }
+    }
+    return result.empty() ? L"0" : result;
+}
+
+std::wstring syntheticArithmeticText(const std::vector<double>& dividend, const ExactFraction& root) {
+    if (dividend.size() < 2)
+        return L"";
+    std::wostringstream out;
+    double carried = dividend.back();
+    out << L"    先落下首项系数 " << symbolicNumber(carried) << L"。\r\n";
+    for (size_t index = dividend.size() - 1; index-- > 0;) {
+        const double product = carried * root.value();
+        const double sum = dividend[index] + product;
+        out << L"    " << symbolicNumber(carried) << L" × (" << root.text() << L") = "
+            << symbolicNumber(product) << L"；" << symbolicNumber(dividend[index]) << L" + ("
+            << symbolicNumber(product) << L") = " << symbolicNumber(sum);
+        if (index == 0)
+            out << L"（余数）";
+        out << L"。\r\n";
+        carried = sum;
+    }
+    return out.str();
+}
+
 struct DisplayRoot {
     std::complex<double> value{};
     std::wstring text;
     bool approximate = false;
 };
+
+bool displayRootLess(const DisplayRoot& left, const DisplayRoot& right) {
+    const bool leftReal = std::abs(left.value.imag()) < 1e-8;
+    const bool rightReal = std::abs(right.value.imag()) < 1e-8;
+    if (leftReal != rightReal)
+        return leftReal;
+    if (leftReal) {
+        const int leftPriority = realRootPriority(left.value.real());
+        const int rightPriority = realRootPriority(right.value.real());
+        if (leftPriority != rightPriority)
+            return leftPriority < rightPriority;
+    }
+    if (std::abs(left.value.real() - right.value.real()) > 1e-8)
+        return left.value.real() < right.value.real();
+    return left.value.imag() < right.value.imag();
+}
 
 std::wstring approximateComplex(std::complex<double> value) {
     if (std::abs(value.imag()) < 5e-9)
@@ -1921,6 +2067,7 @@ std::optional<SolveResult> solveCubicByCardano(const std::wstring& text, const P
             {{complexReal, complexImaginary}, complexRealText + L" + " + complexImaginaryText + L"i", false});
 
         process << L"方法一：卡尔达诺公式\r\n"
+                << L"思路：先用平移换元去掉二次项，再把新未知数拆成两个数的和。\r\n"
                 << L"令 x = u " << (shift->numerator < 0 ? L"- " : L"+ ")
                 << ExactFraction(std::abs(shift->numerator), shift->denominator).text()
                 << L"，得到降幂三次方程 u³ + pu + q = 0。\r\n"
@@ -1966,8 +2113,7 @@ std::optional<SolveResult> solveCubicByCardano(const std::wstring& text, const P
                                                           std::cos((theta + 2.0 * index * kPi) / 3.0);
             appendDisplayRoot(roots, {{rootValue, 0.0}, rootText, false});
         }
-        std::sort(roots.begin(), roots.end(),
-                  [](const auto& left, const auto& right) { return left.value.real() < right.value.real(); });
+        std::stable_sort(roots.begin(), roots.end(), displayRootLess);
         process << L"方法一：三角形式的卡尔达诺公式\r\n"
                 << L"令 x = u " << (shift->numerator < 0 ? L"- " : L"+ ")
                 << ExactFraction(std::abs(shift->numerator), shift->denominator).text()
@@ -2064,15 +2210,7 @@ std::optional<SolveResult> solveQuarticByFerrari(const std::wstring& text, const
             appendDisplayRoot(roots, {shiftValue + root, shiftedText(squareRootText, true), false});
             appendDisplayRoot(roots, {shiftValue - root, shiftedText(squareRootText, false), false});
         }
-        std::sort(roots.begin(), roots.end(), [](const auto& left, const auto& right) {
-            const bool leftReal = std::abs(left.value.imag()) < 1e-8;
-            const bool rightReal = std::abs(right.value.imag()) < 1e-8;
-            if (leftReal != rightReal)
-                return leftReal;
-            if (std::abs(left.value.real() - right.value.real()) > 1e-8)
-                return left.value.real() < right.value.real();
-            return left.value.imag() < right.value.imag();
-        });
+        std::stable_sort(roots.begin(), roots.end(), displayRootLess);
 
         std::wstring summary = L"解：";
         for (size_t index = 0; index < roots.size(); ++index) {
@@ -2090,16 +2228,14 @@ std::optional<SolveResult> solveQuarticByFerrari(const std::wstring& text, const
                 << ExactFraction(std::abs(shift->numerator), shift->denominator).text()
                 << L"，原方程化为 y⁴ + py² + r = 0。\r\n"
                 << L"    y⁴ + (" << p->text() << L")y² + (" << r->text() << L") = 0\r\n"
-                << L"再令 t = y²，精确求解 t² + (" << p->text() << L")t + (" << r->text()
-                << L") = 0：\r\n";
+                << L"再令 t = y²，精确求解 t² + (" << p->text() << L")t + (" << r->text() << L") = 0：\r\n";
         for (size_t index = 0; index < tRoots.texts.size(); ++index)
             process << L"    t" << subscriptNumber(index + 1) << L" = " << tRoots.texts[index] << L"\r\n";
         process << L"对每个 t 解 y² = t，最后由 x = y + (" << shift->text()
                 << L") 还原并保留精确根式。\r\n\r\n"
                 << L"方法二：平移后因式分解法\r\n"
                 << L"根据上面两个 t 根，降幂四次式可直接写成：\r\n"
-                << L"    (y² - (" << firstT << L"))(y² - (" << secondT
-                << L")) = 0\r\n"
+                << L"    (y² - (" << firstT << L"))(y² - (" << secondT << L")) = 0\r\n"
                 << L"分别令两个因式为 0：\r\n"
                 << L"    y² = " << firstT << L"，或 y² = " << secondT << L"\r\n"
                 << L"每个等式各取正、负平方根，再由 x = y + (" << shift->text()
@@ -2185,15 +2321,7 @@ std::optional<SolveResult> solveQuarticByFerrari(const std::wstring& text, const
          false},
         {shiftValue + (s + secondRoot) / 2.0, shiftedRootText(sText + L" + " + secondSquareRoot), false},
         {shiftValue + (s - secondRoot) / 2.0, shiftedRootText(sText + L" - " + secondSquareRoot), false}};
-    std::sort(roots.begin(), roots.end(), [](const auto& left, const auto& right) {
-        const bool leftReal = std::abs(left.value.imag()) < 1e-8;
-        const bool rightReal = std::abs(right.value.imag()) < 1e-8;
-        if (leftReal != rightReal)
-            return leftReal;
-        if (std::abs(left.value.real() - right.value.real()) > 1e-8)
-            return left.value.real() < right.value.real();
-        return left.value.imag() < right.value.imag();
-    });
+    std::stable_sort(roots.begin(), roots.end(), displayRootLess);
 
     std::wstring summary = L"解：";
     for (size_t index = 0; index < roots.size(); ++index) {
@@ -2209,11 +2337,13 @@ std::optional<SolveResult> solveQuarticByFerrari(const std::wstring& text, const
     process << L"输入原式：" << displayRootNotation(text) << L"\r\n"
             << L"移项并合并同类项：\r\n    " << polynomialText(polynomial) << L" = 0\r\n\r\n"
             << L"方法一：费拉里法\r\n"
+            << L"目标：把四次式拆成两个二次式，然后用熟悉的二次方程求根公式。\r\n"
             << L"令 x = y " << (shift->numerator < 0 ? L"- " : L"+ ")
             << ExactFraction(std::abs(shift->numerator), shift->denominator).text()
             << L"，原方程化为 y⁴ + py² + qy + r = 0。\r\n"
             << L"    p = " << p->text() << L"，q = " << q->text() << L"，r = " << r->text()
-            << L"\r\n令 m 满足预解三次方程：\r\n"
+            << L"\r\n为了把它配成两个二次因式，引入辅助数 m；m 不是原方程的答案。\r\n"
+            << L"令 m 满足预解三次方程：\r\n"
             << L"    m³ + 2pm² + (p² - 4r)m - q² = 0\r\n"
             << L"取正实根 m = " << mText << L"，再令 s = √m = " << sText
             << L"。\r\n把四次式配成两个二次式后，两个判别式分别为：\r\n"
@@ -2229,8 +2359,8 @@ std::optional<SolveResult> solveQuarticByFerrari(const std::wstring& text, const
             << L"    t = " << tFactorText << L"\r\n"
             << L"    u = " << uFactorText << L"\r\n"
             << L"因此原式分解为：\r\n"
-            << L"    (y² + (" << sText << L")y + (" << tFactorText << L"))"
-            << L"(y² - (" << sText << L")y + (" << uFactorText << L")) = 0\r\n"
+            << L"    (y² + (" << sText << L")y + (" << tFactorText << L"))" << L"(y² - (" << sText
+            << L")y + (" << uFactorText << L")) = 0\r\n"
             << L"分别解两个二次方程：\r\n"
             << L"    y = (-s ± √Δ₁)/2，或 y = (s ± √Δ₂)/2\r\n"
             << L"最后由 x = y + (" << shift->text() << L") 还原，四个根与费拉里法一致。";
@@ -2319,11 +2449,7 @@ SolveResult solveHigherDegreeEquation(const std::wstring& text, const Polynomial
                     appendDisplayRoot(roots, {{0.0, -std::sqrt(-t)}, L"-" + value, false});
                 }
             }
-            std::sort(roots.begin(), roots.end(), [](const auto& left, const auto& right) {
-                if (std::abs(left.value.real() - right.value.real()) > 1e-8)
-                    return left.value.real() < right.value.real();
-                return left.value.imag() < right.value.imag();
-            });
+            std::stable_sort(roots.begin(), roots.end(), displayRootLess);
             std::wstring summary = L"解：";
             for (size_t i = 0; i < roots.size(); ++i) {
                 if (i)
@@ -2336,18 +2462,18 @@ SolveResult solveHigherDegreeEquation(const std::wstring& text, const Polynomial
             process << L"输入原式：" << displayRootNotation(text) << L"\r\n"
                     << L"移项并合并同类项：\r\n    " << polynomialText(polynomial) << L" = 0\r\n\r\n"
                     << L"方法一：换元法\r\n"
+                    << L"因为 x⁴ = (x²)²，先把 x² 看成一个整体，四次方程就会变成熟悉的二次方程。\r\n"
                     << L"令 t = x²，原方程化为关于 t 的一元二次方程：\r\n    "
                     << symbolicNumber(coefficients[4]) << L"t² + " << symbolicNumber(coefficients[2])
                     << L"t + " << symbolicNumber(coefficients[0]) << L" = 0\r\n"
                     << tRoots.calculation << L"\r\n再由 x² = t 求出上述各根。\r\n\r\n"
                     << L"方法二：因式分解法\r\n"
                     << L"由方法一算得的两个 t 根，四次多项式可写为：\r\n"
-                    << L"    " << symbolicNumber(coefficients[4]) << L"(x² - (" << firstT
-                    << L"))(x² - (" << secondT << L")) = 0\r\n"
+                    << L"    " << symbolicNumber(coefficients[4]) << L"(x² - (" << firstT << L"))(x² - ("
+                    << secondT << L")) = 0\r\n"
                     << L"根据零乘积性质，分别解：\r\n"
                     << L"    x² = " << firstT << L"，或 x² = " << secondT << L"\r\n"
-                    << L"对非负 t 取 x = ±√t；对负 t 取 x = ±√(-t)i，"
-                    << L"化简后所得根与换元法一致。";
+                    << L"对非负 t 取 x = ±√t；对负 t 取 x = ±√(-t)i，" << L"化简后所得根与换元法一致。";
             if (rootsOutput)
                 *rootsOutput = roots;
             return {summary, process.str()};
@@ -2385,10 +2511,12 @@ SolveResult solveHigherDegreeEquation(const std::wstring& text, const Polynomial
     }
 
     bool exactRemainder = true;
+    ExactRootResult exactRemainderResult;
     const int remainingDegree = static_cast<int>(remaining.size()) - 1;
     if (remainingDegree == 2) {
         const ExactRootResult exact = exactRoots(remaining[2], remaining[1], remaining[0]);
         if (exact.available && !exact.texts.empty()) {
+            exactRemainderResult = exact;
             if (exact.hasRealRoots) {
                 for (size_t i = 0; i < exact.texts.size(); ++i)
                     appendDisplayRoot(roots, {{exact.values[i], 0.0}, exact.texts[i], false});
@@ -2405,10 +2533,12 @@ SolveResult solveHigherDegreeEquation(const std::wstring& text, const Polynomial
         }
     } else if (remainingDegree == 1) {
         const ExactRootResult exact = exactRoots(0.0, remaining[1], remaining[0]);
-        if (exact.available && !exact.texts.empty())
+        if (exact.available && !exact.texts.empty()) {
+            exactRemainderResult = exact;
             appendDisplayRoot(roots, {{exact.values.front(), 0.0}, exact.texts.front(), false});
-        else
+        } else {
             exactRemainder = false;
+        }
     } else if (remainingDegree > 0) {
         exactRemainder = false;
     }
@@ -2416,15 +2546,7 @@ SolveResult solveHigherDegreeEquation(const std::wstring& text, const Polynomial
         for (const auto root : complexPolynomialRoots(remaining))
             appendDisplayRoot(roots, {root, approximateComplex(root), true});
     }
-    std::sort(roots.begin(), roots.end(), [](const auto& left, const auto& right) {
-        const bool leftReal = std::abs(left.value.imag()) < 1e-8;
-        const bool rightReal = std::abs(right.value.imag()) < 1e-8;
-        if (leftReal != rightReal)
-            return leftReal;
-        if (std::abs(left.value.real() - right.value.real()) > 1e-8)
-            return left.value.real() < right.value.real();
-        return left.value.imag() < right.value.imag();
-    });
+    std::stable_sort(roots.begin(), roots.end(), displayRootLess);
 
     std::wstring summary = L"解：";
     for (size_t i = 0; i < roots.size(); ++i) {
@@ -2436,26 +2558,63 @@ SolveResult solveHigherDegreeEquation(const std::wstring& text, const Polynomial
     process << L"输入原式：" << displayRootNotation(text) << L"\r\n"
             << L"移项并合并同类项：\r\n    " << polynomialText(polynomial) << L" = 0\r\n\r\n";
     if (!rationalFactors.empty()) {
-        process << L"方法一：有理根定理与因式分解法\r\n";
-        for (const auto& root : rationalFactors)
-            process << L"检验得到有理根 x = " << root.text() << L"，提取因式 (x - (" << root.text()
-                    << L"))。\r\n";
-        process << L"继续分解剩余低次多项式，得到结果中的全部根。\r\n\r\n"
-                << L"方法二：综合除法与低次方程公式\r\n"
-                << L"按降幂顺序写出系数，并对每个有理根执行“首项落下、乘根、与下一项相加”：\r\n";
+        process << L"方法一：有理根定理与因式分解法\r\n"
+                << L"目标：先找到一个容易计算的根，就能把三次或四次方程降低一次。\r\n";
         for (size_t index = 0; index < syntheticSteps.size(); ++index) {
             const auto& step = syntheticSteps[index];
-            process << L"第 " << index + 1 << L" 次综合除法，使用根 r = " << step.root.text() << L"：\r\n"
-                    << L"    " << coefficientPolynomialText(step.dividend) << L"\r\n"
-                    << L"    = (x - (" << step.root.text() << L"))("
-                    << coefficientPolynomialText(step.quotient) << L")\r\n";
+            process << L"\r\n第 " << index + 1 << L" 步：对当前多项式 P" << index + 1 << L"(x) = "
+                    << coefficientPolynomialText(step.dividend) << L" 寻找有理根。\r\n";
+            if (const auto integer = integerPolynomial(step.dividend)) {
+                process << L"有理根定理：候选根可写成 ±p/q，p 是常数项的因数，q 是最高次项系数的因数。\r\n"
+                        << L"    p 可取：" << integerListText(positiveDivisors(integer->front()))
+                        << L"；q 可取：" << integerListText(positiveDivisors(integer->back())) << L"。\r\n";
+            }
+            process << L"从绝对值较小的候选数开始代入，取 x = " << step.root.text() << L"：\r\n"
+                    << L"    P" << index + 1 << L"(" << step.root.text() << L") = "
+                    << substitutedPolynomialText(step.dividend, step.root) << L" = 0。\r\n"
+                    << L"代入后结果为 0，所以 x = " << step.root.text() << L" 是根。根据因式定理，P"
+                    << index + 1 << L"(x) 含有因式 " << linearFactorText(step.root) << L"。\r\n"
+                    << L"除去这个因式，得到低一次的多项式：\r\n    "
+                    << coefficientPolynomialText(step.quotient) << L"。\r\n";
         }
-        process << L"降次后得到 " << coefficientPolynomialText(remaining) << L" = 0。\r\n";
+        std::wstring partialFactorization;
+        for (const ExactFraction& root : rationalFactors)
+            partialFactorization += linearFactorText(root);
+        partialFactorization += L"(" + coefficientPolynomialText(remaining) + L")";
+        process << L"\r\n原方程因此可写成：\r\n    " << partialFactorization << L" = 0。\r\n"
+                << L"乘积等于 0 时，至少一个因式等于 0。现在只需解最后的低次方程：\r\n    "
+                << coefficientPolynomialText(remaining) << L" = 0\r\n";
+        if (exactRemainderResult.available && !exactRemainderResult.texts.empty()) {
+            process << exactRemainderResult.calculation << L"\r\n解得：";
+            for (size_t index = 0; index < exactRemainderResult.texts.size(); ++index) {
+                if (index)
+                    process << L"，";
+                process << L"x = " << exactRemainderResult.texts[index];
+            }
+            process << L"。\r\n";
+        }
+        process << L"合并前面找到的根与低次方程的根，就得到原方程的全部根。\r\n\r\n"
+                << L"方法二：综合除法与低次方程公式\r\n"
+                << L"综合除法是“除以 x - r”的简写算法。只写系数，每次按“落下、相乘、相加”计算。\r\n";
+        for (size_t index = 0; index < syntheticSteps.size(); ++index) {
+            const auto& step = syntheticSteps[index];
+            process << L"\r\n第 " << index + 1 << L" 次综合除法，使用根 r = " << step.root.text() << L"：\r\n"
+                    << L"    原系数（按降幂排列）：" << coefficientListText(step.dividend) << L"。\r\n"
+                    << syntheticArithmeticText(step.dividend, step.root)
+                    << L"    余数为 0，说明可以整除。商的系数为：" << coefficientListText(step.quotient)
+                    << L"。\r\n"
+                    << L"    因此：" << coefficientPolynomialText(step.dividend) << L" = "
+                    << linearFactorText(step.root) << L"(" << coefficientPolynomialText(step.quotient)
+                    << L")。\r\n";
+        }
+        process << L"\r\n降次后得到：" << coefficientPolynomialText(remaining) << L" = 0。\r\n";
         if (remainingDegree == 2)
-            process << L"对这个二次方程计算判别式并使用求根公式；\r\n";
+            process << L"这是一元二次方程，先算 Δ = b² - 4ac，再使用 x = (-b ± √Δ)/(2a)。\r\n";
         else if (remainingDegree == 1)
-            process << L"对这个一次方程移项并除以 x 的系数；\r\n";
-        process << L"合并综合除法得到的根与低次方程的根，即为原方程的全部根。\r\n";
+            process << L"这是一元一次方程，把常数项移到右边，再除以 x 的系数。\r\n";
+        if (exactRemainderResult.available)
+            process << exactRemainderResult.calculation << L"\r\n";
+        process << L"合并综合除法得到的根与最后低次方程的根，即为原方程的全部根。\r\n";
     } else {
         process << L"使用 Durand-Kerner 数值迭代同时求出多项式的全部实根和复数根。\r\n";
     }
@@ -2465,7 +2624,7 @@ SolveResult solveHigherDegreeEquation(const std::wstring& text, const Polynomial
     return {summary, process.str()};
 }
 
-// ---------- 二元二次方程组：Sylvester 结式、回代和实数验根 ----------
+// ---------- 二元多项式方程组：Sylvester 结式、回代和实数验根 ----------
 
 using UniPolynomial = std::vector<long double>;
 
@@ -2588,25 +2747,25 @@ std::wstring uniPolynomialText(const UniPolynomial& polynomial) {
 }
 
 std::vector<double> yCandidates(const Polynomial& polynomial, double x, bool& identity) {
-    const double a = polynomial.coefficient(0, 2);
-    const double b = polynomial.coefficient(0, 1) + polynomial.coefficient(1, 1) * x;
-    const double c = polynomial.coefficient(0, 0) + polynomial.coefficient(1, 0) * x +
-                     polynomial.coefficient(2, 0) * x * x;
-    identity = false;
-    if (std::abs(a) >= 1e-9) {
-        const double delta = b * b - 4.0 * a * c;
-        if (delta < -1e-8)
-            return {};
-        const double root = std::sqrt(std::max(0.0, delta));
-        std::vector<double> values{(-b + root) / (2.0 * a)};
-        if (root > 1e-8)
-            values.push_back((-b - root) / (2.0 * a));
-        return values;
+    std::vector<long double> coefficients(static_cast<size_t>(polynomial.degree(1) + 1), 0.0L);
+    for (const auto& [powers, coefficient] : polynomial.terms) {
+        if (powers[2] != 0)
+            continue;
+        coefficients[static_cast<size_t>(powers[1])] +=
+            static_cast<long double>(coefficient) * std::pow(static_cast<long double>(x), powers[0]);
     }
-    if (std::abs(b) >= 1e-9)
-        return {-c / b};
-    identity = std::abs(c) < 1e-7;
-    return {};
+    long double scale = 1.0L;
+    for (const long double coefficient : coefficients)
+        scale += std::abs(coefficient);
+    while (coefficients.size() > 1 && std::abs(coefficients.back()) <= 1e-15L * scale)
+        coefficients.pop_back();
+    identity = coefficients.size() == 1 && std::abs(coefficients.front()) <= 1e-12L * scale;
+    if (identity || coefficients.size() <= 1)
+        return {};
+    std::vector<double> values;
+    for (const long double root : realPolynomialRoots(std::move(coefficients)))
+        values.push_back(static_cast<double>(root));
+    return values;
 }
 
 bool satisfiesPolynomial(const Polynomial& polynomial, double x, double y) {
@@ -2659,8 +2818,7 @@ std::optional<ExactFraction> nearbySimpleFraction(double value) {
     return std::nullopt;
 }
 
-bool verifiedRationalPoint(const Polynomial& polynomial, const ExactFraction& x,
-                           const ExactFraction& y) {
+bool verifiedRationalPoint(const Polynomial& polynomial, const ExactFraction& x, const ExactFraction& y) {
     const long double xValue = static_cast<long double>(x.numerator) / x.denominator;
     const long double yValue = static_cast<long double>(y.numerator) / y.denominator;
     long double value = 0.0L;
@@ -2669,8 +2827,8 @@ bool verifiedRationalPoint(const Polynomial& polynomial, const ExactFraction& x,
         const auto exactCoefficient = rationalize(coefficient);
         if (!exactCoefficient)
             return false;
-        long double term = static_cast<long double>(exactCoefficient->numerator) /
-                           exactCoefficient->denominator;
+        long double term =
+            static_cast<long double>(exactCoefficient->numerator) / exactCoefficient->denominator;
         for (int power = 0; power < powers[0]; ++power)
             term *= xValue;
         for (int power = 0; power < powers[1]; ++power)
@@ -2704,15 +2862,12 @@ std::optional<Polynomial> linearRelationForY(const std::array<Polynomial, 2>& eq
 
     const std::array<Powers, 3> quadraticTerms{{{2, 0, 0}, {1, 1, 0}, {0, 2, 0}}};
     for (const Powers& powers : quadraticTerms) {
-        const double firstCoefficient =
-            equations[0].coefficient(powers[0], powers[1], powers[2]);
-        const double secondCoefficient =
-            equations[1].coefficient(powers[0], powers[1], powers[2]);
+        const double firstCoefficient = equations[0].coefficient(powers[0], powers[1], powers[2]);
+        const double secondCoefficient = equations[1].coefficient(powers[0], powers[1], powers[2]);
         if (std::abs(firstCoefficient) < kEpsilon || std::abs(secondCoefficient) < kEpsilon)
             continue;
-        Polynomial relation =
-            add(multiply(Polynomial::constant(secondCoefficient), equations[0]),
-                multiply(Polynomial::constant(firstCoefficient), equations[1]), -1.0);
+        Polynomial relation = add(multiply(Polynomial::constant(secondCoefficient), equations[0]),
+                                  multiply(Polynomial::constant(firstCoefficient), equations[1]), -1.0);
         relation.clean();
         if (relation.totalDegree() <= 1 && std::abs(relation.coefficient(0, 1)) >= kEpsilon)
             return relation;
@@ -2720,9 +2875,9 @@ std::optional<Polynomial> linearRelationForY(const std::array<Polynomial, 2>& eq
     return std::nullopt;
 }
 
-std::vector<ExactSystemPointText> exactSystemPointTexts(
-    const UniPolynomial& resultant, const std::array<Polynomial, 2>& equations,
-    const std::vector<SystemPoint>& points) {
+std::vector<ExactSystemPointText> exactSystemPointTexts(const UniPolynomial& resultant,
+                                                        const std::array<Polynomial, 2>& equations,
+                                                        const std::vector<SystemPoint>& points) {
     std::vector<ExactSystemPointText> texts(points.size());
     if (resultant.empty() || resultant.size() > 3)
         return texts;
@@ -2759,8 +2914,7 @@ std::vector<ExactSystemPointText> exactSystemPointTexts(
                 closest = &expression;
             }
         }
-        if (!closest || closestDistance >
-                            1e-7 * std::max(1.0, std::abs(points[pointIndex].x))) {
+        if (!closest || closestDistance > 1e-7 * std::max(1.0, std::abs(points[pointIndex].x))) {
             continue;
         }
 
@@ -2781,7 +2935,7 @@ std::vector<ExactSystemPointText> exactSystemPointTexts(
 
 SolveResult solveQuadraticSystem(const std::vector<std::wstring>& lines, AngleUnit angleUnit) {
     if (lines.size() != 2)
-        throw ParseError("二元二次方程组需要输入两行方程");
+        throw ParseError("二元多项式方程组需要输入两行方程");
     std::array<Polynomial, 2> equations;
     for (size_t i = 0; i < lines.size(); ++i) {
         Parser parser(lines[i], angleUnit);
@@ -2789,18 +2943,20 @@ SolveResult solveQuadraticSystem(const std::vector<std::wstring>& lines, AngleUn
         if (relation.relation != TokenType::Equal)
             throw ParseError("方程组中的每一行都必须使用等号 =");
         if (parser.fractionalScale() > 1)
-            throw ParseError("二元二次方程组暂不支持分数指数");
+            throw ParseError("二元多项式方程组暂不支持分数指数");
         const RationalExpression difference = add(relation.left, relation.right, -1.0);
         if (!difference.denominator.isConstant())
-            throw ParseError("二元二次方程组暂不支持未知数位于分母");
+            throw ParseError("二元多项式方程组暂不支持未知数位于分母");
         equations[i] = difference.numerator;
         if (equations[i].usesVariable(2))
-            throw ParseError("二元二次方程组只能包含两个未知数");
-        if (equations[i].totalDegree() > 2)
-            throw ParseError("二元二次方程组中每个方程的总次数不能超过 2");
+            throw ParseError("二元多项式方程组只能包含两个未知数");
+        if (equations[i].totalDegree() > 4 || equations[i].degree(0) > 4 || equations[i].degree(1) > 4) {
+            throw ParseError("二元多项式方程组目前支持每个未知数次数及总次数不超过 4");
+        }
     }
     if (!equations[0].usesVariable(1) && !equations[1].usesVariable(1))
-        throw ParseError("二元二次方程组必须包含两个未知数");
+        throw ParseError("二元多项式方程组必须包含两个未知数");
+    const bool higherDegree = equations[0].totalDegree() > 2 || equations[1].totalDegree() > 2;
     if (equations[0].totalDegree() <= 1 && equations[1].totalDegree() <= 1) {
         std::array<std::array<double, 3>, 2> linear{};
         for (size_t i = 0; i < 2; ++i)
@@ -2823,17 +2979,15 @@ SolveResult solveQuadraticSystem(const std::vector<std::wstring>& lines, AngleUn
     if (resultant.size() <= 3) {
         const double a = resultant.size() > 2 ? static_cast<double>(resultant[2]) : 0.0;
         const double b = resultant.size() > 1 ? static_cast<double>(resultant[1]) : 0.0;
-        const ExactRootResult exactResultantRoots =
-            exactRoots(a, b, static_cast<double>(resultant[0]));
+        const ExactRootResult exactResultantRoots = exactRoots(a, b, static_cast<double>(resultant[0]));
         if (exactResultantRoots.available && exactResultantRoots.hasRealRoots &&
             !exactResultantRoots.expressions.empty()) {
             for (const ExactRootExpression& root : exactResultantRoots.expressions) {
-                const long double rational = static_cast<long double>(root.rational.numerator) /
-                                             root.rational.denominator;
-                const long double radical =
-                    static_cast<long double>(root.radicalCoefficient.numerator) /
-                    root.radicalCoefficient.denominator *
-                    std::sqrt(static_cast<long double>(root.radicand));
+                const long double rational =
+                    static_cast<long double>(root.rational.numerator) / root.rational.denominator;
+                const long double radical = static_cast<long double>(root.radicalCoefficient.numerator) /
+                                            root.radicalCoefficient.denominator *
+                                            std::sqrt(static_cast<long double>(root.radicand));
                 xRoots.push_back(rational + radical);
             }
         }
@@ -2848,9 +3002,11 @@ SolveResult solveQuadraticSystem(const std::vector<std::wstring>& lines, AngleUn
         const double x = static_cast<double>(xRoot);
         bool firstIdentity = false;
         bool secondIdentity = false;
-        std::vector<double> candidates = yCandidates(equations[0], x, firstIdentity);
+        const size_t primary = equations[0].degree(1) <= equations[1].degree(1) ? 0 : 1;
+        const size_t secondary = 1 - primary;
+        std::vector<double> candidates = yCandidates(equations[primary], x, firstIdentity);
         if (firstIdentity)
-            candidates = yCandidates(equations[1], x, secondIdentity);
+            candidates = yCandidates(equations[secondary], x, secondIdentity);
         if (firstIdentity && secondIdentity) {
             hasVerticalFamily = true;
             continue;
@@ -2867,15 +3023,22 @@ SolveResult solveQuadraticSystem(const std::vector<std::wstring>& lines, AngleUn
                 << L"\r\n\r\n方法一：结式消元法\r\n"
                 << L"消去 y 得 R(x) = " << uniPolynomialText(resultant)
                 << L" = 0。\r\n该结式没有产生同时满足两个原方程的实数坐标。";
-        return {L"结论：二元二次方程组无实数解", process.str()};
+        return {L"结论：二元多项式方程组无实数解", process.str()};
     }
-    std::sort(points.begin(), points.end(), [](const auto& left, const auto& right) {
+    std::stable_sort(points.begin(), points.end(), [](const auto& left, const auto& right) {
+        const int leftPriority = realRootPriority(left.x);
+        const int rightPriority = realRootPriority(right.x);
+        if (leftPriority != rightPriority)
+            return leftPriority < rightPriority;
         if (std::abs(left.x - right.x) > 1e-8)
             return left.x < right.x;
+        const int leftYRootPriority = realRootPriority(left.y);
+        const int rightYRootPriority = realRootPriority(right.y);
+        if (leftYRootPriority != rightYRootPriority)
+            return leftYRootPriority < rightYRootPriority;
         return left.y < right.y;
     });
-    std::vector<ExactSystemPointText> exactCoordinates =
-        exactSystemPointTexts(resultant, equations, points);
+    std::vector<ExactSystemPointText> exactCoordinates = exactSystemPointTexts(resultant, equations, points);
     fillVerifiedRationalPointTexts(equations, points, exactCoordinates);
     std::wstring summary = L"实数解：";
     for (size_t i = 0; i < points.size(); ++i) {
@@ -2886,9 +3049,8 @@ SolveResult solveQuadraticSystem(const std::vector<std::wstring>& lines, AngleUn
         const std::wstring xText = exactCoordinates[i].x.value_or(fallbackXText);
         const std::wstring yText = exactCoordinates[i].y.value_or(fallbackYText);
         const std::wstring suffix = points.size() > 1 ? subscriptNumber(i + 1) : L"";
-        summary += L"x" + suffix + (exactCoordinates[i].x || !xApproximate ? L" = " : L" ≈ ") +
-                   xText + L"，y" + suffix +
-                   (exactCoordinates[i].y || !yApproximate ? L" = " : L" ≈ ") + yText;
+        summary += L"x" + suffix + (exactCoordinates[i].x || !xApproximate ? L" = " : L" ≈ ") + xText +
+                   L"，y" + suffix + (exactCoordinates[i].y || !yApproximate ? L" = " : L" ≈ ") + yText;
     }
 
     Polynomial reducedRelation;
@@ -2896,34 +3058,35 @@ SolveResult solveQuadraticSystem(const std::vector<std::wstring>& lines, AngleUn
     const std::array<std::pair<Powers, const wchar_t*>, 3> quadraticTerms{
         {{{2, 0, 0}, L"x²"}, {{1, 1, 0}, L"xy"}, {{0, 2, 0}, L"y²"}}};
     for (const auto& [powers, label] : quadraticTerms) {
-        const double firstCoefficient =
-            equations[0].coefficient(powers[0], powers[1], powers[2]);
-        const double secondCoefficient =
-            equations[1].coefficient(powers[0], powers[1], powers[2]);
+        if (higherDegree)
+            break;
+        const double firstCoefficient = equations[0].coefficient(powers[0], powers[1], powers[2]);
+        const double secondCoefficient = equations[1].coefficient(powers[0], powers[1], powers[2]);
         if (std::abs(firstCoefficient) < kEpsilon || std::abs(secondCoefficient) < kEpsilon)
             continue;
-        reducedRelation =
-            add(multiply(Polynomial::constant(secondCoefficient), equations[0]),
-                multiply(Polynomial::constant(firstCoefficient), equations[1]), -1.0);
+        reducedRelation = add(multiply(Polynomial::constant(secondCoefficient), equations[0]),
+                              multiply(Polynomial::constant(firstCoefficient), equations[1]), -1.0);
         if (reducedRelation.isZero())
             continue;
-        eliminationDescription =
-            L"用 (" + symbolicNumber(secondCoefficient) + L")×(1) - (" +
-            symbolicNumber(firstCoefficient) + L")×(2)，消去 " + label + L" 项";
+        eliminationDescription = L"用 (" + symbolicNumber(secondCoefficient) + L")×(1) - (" +
+                                 symbolicNumber(firstCoefficient) + L")×(2)，消去 " + label + L" 项";
         break;
     }
 
     std::wostringstream process;
     process << L"输入方程组：\r\n    " << lines[0] << L"\r\n    " << lines[1]
             << L"\r\n\r\n方法一：结式消元法\r\n"
-            << L"把两个方程都看成关于 y 的二次多项式，计算结式并消去 y：\r\n    R(x) = "
+            << L"把两个方程都看成关于 y 的多项式，建立 Sylvester 矩阵并计算结式以消去 y：\r\n    R(x) = "
             << uniPolynomialText(resultant) << L" = 0\r\n"
-            << L"解出所有实数 x，再逐一回代求 y，并舍去不同时满足两式的候选点。\r\n\r\n"
-            << L"方法二：加减消元与代入法\r\n"
-            << L"先把两个方程写成左边为多项式、右边为 0 的标准式：\r\n"
+            << L"求出结式的全部实根 x；每个 x 都要回代原方程，排除结式引入的伪根。\r\n\r\n"
+            << (higherDegree ? L"方法二：逐根回代与双式验算法\r\n" : L"方法二：加减消元与代入法\r\n")
+            << L"先把两个方程展开并写成左边为多项式、右边为 0 的标准式：\r\n"
             << L"    (1) " << polynomialText(equations[0]) << L" = 0\r\n"
             << L"    (2) " << polynomialText(equations[1]) << L" = 0\r\n";
-    if (!eliminationDescription.empty()) {
+    if (higherDegree) {
+        process << L"对结式得到的每个 x，优先代入关于 y 次数较低的方程求出全部实数 y；"
+                << L"再将每个候选坐标同时代入 (1)、(2)，只有两式残差均在允许范围内才保留。\r\n";
+    } else if (!eliminationDescription.empty()) {
         process << eliminationDescription << L"：\r\n"
                 << L"    " << polynomialText(reducedRelation) << L" = 0\r\n"
                 << L"这就是少一个二次项的降次关系。把它与 (1) 联立，先求一个未知数，再代入求另一个。\r\n";
@@ -2937,9 +3100,8 @@ SolveResult solveQuadraticSystem(const std::vector<std::wstring>& lines, AngleUn
         const std::wstring yText = exactCoordinates[i].y.value_or(fallbackYText);
         process << L"第 " << i + 1 << L" 组：取 x "
                 << (exactCoordinates[i].x || !xApproximate ? L"= " : L"≈ ") << xText
-                << L"，代入降次关系及 (1)，解得 y "
-                << (exactCoordinates[i].y || !yApproximate ? L"= " : L"≈ ") << yText
-                << L"。\r\n"
+                << (higherDegree ? L"，回代次数较低的方程，解得 y " : L"，代入降次关系及 (1)，解得 y ")
+                << (exactCoordinates[i].y || !yApproximate ? L"= " : L"≈ ") << yText << L"。\r\n"
                 << L"验算第 " << i + 1 << L" 组解：代入两个原方程，左右两边均相等。\r\n";
     }
     process << L"全部候选点均已完成回代筛选，所得坐标与结式法一致。\r\n";
@@ -3148,8 +3310,13 @@ SolveResult solveAbsoluteEquation(const std::wstring& text, AngleUnit angleUnit)
         }
     }
 
-    std::sort(solutions.begin(), solutions.end(),
-              [](const auto& left, const auto& right) { return left.value < right.value; });
+    std::stable_sort(solutions.begin(), solutions.end(), [](const auto& left, const auto& right) {
+        const int leftPriority = realRootPriority(left.value);
+        const int rightPriority = realRootPriority(right.value);
+        if (leftPriority != rightPriority)
+            return leftPriority < rightPriority;
+        return left.value < right.value;
+    });
     if (solutions.empty())
         return {L"结论：方程无解", process.str()};
     if (solutions.size() == 1) {
@@ -3316,6 +3483,7 @@ SolveResult solveFractionalPowerEquation(const std::wstring& text, const Rationa
             validTexts.push_back(xText);
         }
     }
+    sortRootValueTextPairs(validValues, validTexts);
     if (validTexts.empty()) {
         if (candidates.empty())
             process << L"换元方程没有满足条件的实数根。";
@@ -3468,6 +3636,7 @@ SolveResult solveOneEquation(const std::wstring& text, InputKind requested, Angl
                 validTexts.push_back(candidateText);
             }
         }
+        sortRootValueTextPairs(valid, validTexts);
         if (valid.empty()) {
             if (candidates.empty())
                 process << L"方程没有实数候选根。";

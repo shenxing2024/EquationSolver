@@ -6,12 +6,14 @@
 #include <algorithm>
 #include <cstring>
 #include <cwctype>
-#include <wtypes.h>
+#include <objidl.h> // GDI+ requires PROPID from the COM property declarations.
+
 #include <gdiplus.h>
 #include <limits>
 #include <string>
 #include <vector>
 #include <windowsx.h>
+#include <wtypes.h>
 
 namespace mathview {
 namespace {
@@ -28,6 +30,7 @@ struct Element {
     ElementKind kind = ElementKind::Text;
     std::wstring first;
     std::wstring second;
+    bool outsideNegative = false;
 };
 
 struct ViewState {
@@ -55,7 +58,47 @@ COLORREF textColor(const ViewState& state) {
 
 bool isAtomCharacter(wchar_t ch) {
     return std::iswalnum(ch) || ch == L'√' || ch == L'∛' || ch == L'i' || ch == L'₁' || ch == L'₂' ||
-           ch == L'₃' || ch == L'ₓ' || ch == L'ᵧ' || ch == L'^' || ch == L'_' || ch == L'.' || ch == L'-';
+           ch == L'₃' || ch == L'ₓ' || ch == L'ᵧ' || ch == L'^' || ch == L'_' || ch == L'.' || ch == L'-' ||
+           ch == L'−';
+}
+
+bool stripWholeLeadingMinus(std::wstring& value) {
+    size_t first = value.find_first_not_of(L" \t");
+    if (first == std::wstring::npos || (value[first] != L'-' && value[first] != L'−'))
+        return false;
+
+    int roundDepth = 0;
+    int squareDepth = 0;
+    int braceDepth = 0;
+    for (size_t index = first + 1; index < value.size(); ++index) {
+        const wchar_t ch = value[index];
+        if (ch == L'(')
+            ++roundDepth;
+        else if (ch == L')')
+            --roundDepth;
+        else if (ch == L'[')
+            ++squareDepth;
+        else if (ch == L']')
+            --squareDepth;
+        else if (ch == L'{')
+            ++braceDepth;
+        else if (ch == L'}')
+            --braceDepth;
+        else if ((ch == L'+' || ch == L'-' || ch == L'−') && roundDepth == 0 && squareDepth == 0 &&
+                 braceDepth == 0 && value[index - 1] != L'^') {
+            return false;
+        }
+    }
+
+    value.erase(first, 1);
+    first = value.find_first_not_of(L" \t");
+    if (first == std::wstring::npos)
+        return false;
+    if (first > 0)
+        value.erase(0, first);
+    while (!value.empty() && std::iswspace(value.back()))
+        value.pop_back();
+    return !value.empty();
 }
 
 bool parseFraction(const std::wstring& line, size_t start, Element& element, size_t& consumed) {
@@ -113,7 +156,9 @@ bool parseFraction(const std::wstring& line, size_t start, Element& element, siz
             return false;
         denominator = line.substr(denominatorStart, end - denominatorStart);
     }
-    element = {ElementKind::Fraction, numerator, denominator};
+    const bool numeratorNegative = stripWholeLeadingMinus(numerator);
+    const bool denominatorNegative = stripWholeLeadingMinus(denominator);
+    element = {ElementKind::Fraction, numerator, denominator, numeratorNegative != denominatorNegative};
     consumed = end - start;
     return true;
 }
@@ -204,8 +249,10 @@ ElementMetrics measureElement(HDC dc, const Element& element, int baseHeight) {
     if (element.kind == ElementKind::Text)
         return {measureText(dc, element.first), baseHeight + 6};
     if (element.kind == ElementKind::Fraction) {
-        return {std::max(inlineMathWidth(dc, element.first, baseHeight),
-                         inlineMathWidth(dc, element.second, baseHeight)) +
+        const int signWidth = element.outsideNegative ? measureText(dc, L"−") + 2 : 0;
+        return {signWidth +
+                    std::max(inlineMathWidth(dc, element.first, baseHeight),
+                             inlineMathWidth(dc, element.second, baseHeight)) +
                     8,
                 baseHeight * 2 + 9};
     }
@@ -227,20 +274,27 @@ void drawElement(HDC dc, const Element& element, int x, int top, int lineHeight,
         return;
     }
     if (element.kind == ElementKind::Fraction) {
+        int fractionX = x;
+        if (element.outsideNegative) {
+            const std::wstring sign = L"−";
+            TextOutW(dc, fractionX, top + (lineHeight - baseHeight) / 2, sign.c_str(),
+                     static_cast<int>(sign.size()));
+            fractionX += measureText(dc, sign) + 2;
+        }
         const int numeratorWidth = inlineMathWidth(dc, element.first, baseHeight);
         const int denominatorWidth = inlineMathWidth(dc, element.second, baseHeight);
         const int width = std::max(numeratorWidth, denominatorWidth) + 8;
         const int center = top + lineHeight / 2;
-        drawInlineMath(dc, element.first, x + (width - numeratorWidth) / 2, center - baseHeight - 2,
+        drawInlineMath(dc, element.first, fractionX + (width - numeratorWidth) / 2, center - baseHeight - 2,
                        baseHeight + 4, baseHeight, color);
         HPEN pen = CreatePen(PS_SOLID, 1, color);
         HGDIOBJ oldPen = SelectObject(dc, pen);
-        MoveToEx(dc, x + 1, center, nullptr);
-        LineTo(dc, x + width - 1, center);
+        MoveToEx(dc, fractionX + 1, center, nullptr);
+        LineTo(dc, fractionX + width - 1, center);
         SelectObject(dc, oldPen);
         DeleteObject(pen);
-        drawInlineMath(dc, element.second, x + (width - denominatorWidth) / 2, center + 1, baseHeight + 4,
-                       baseHeight, color);
+        drawInlineMath(dc, element.second, fractionX + (width - denominatorWidth) / 2, center + 1,
+                       baseHeight + 4, baseHeight, color);
         return;
     }
 

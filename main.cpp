@@ -64,6 +64,7 @@ constexpr DWORD kWindowCornerPreferenceAttribute = 33;
 constexpr DWORD kCaptionColorAttribute = 35;
 constexpr DWORD kCaptionTextColorAttribute = 36;
 constexpr UINT kDropdownCommitMessage = WM_APP + 101;
+constexpr UINT_PTR kEquationInputSubclassId = 0x45514E49;
 constexpr int kDesignWindowWidth = 1080;
 constexpr int kDesignWindowHeight = 720;
 constexpr int kReferenceWorkWidth = 1600;
@@ -71,13 +72,89 @@ constexpr int kReferenceWorkHeight = 900;
 
 double displayScaleForWorkArea(int workWidth, int workHeight, UINT dpi) {
     const double dpiScale = std::max(0.5, static_cast<double>(dpi) / 96.0);
-    const double resolutionScale =
-        std::min(static_cast<double>(workWidth) / kReferenceWorkWidth,
-                 static_cast<double>(workHeight) / kReferenceWorkHeight);
+    const double resolutionScale = std::min(static_cast<double>(workWidth) / kReferenceWorkWidth,
+                                            static_cast<double>(workHeight) / kReferenceWorkHeight);
     const double availableScale =
         std::min(static_cast<double>(std::max(1, workWidth - 32)) / kDesignWindowWidth,
                  static_cast<double>(std::max(1, workHeight - 32)) / kDesignWindowHeight);
     return std::clamp(std::min(std::max(dpiScale, resolutionScale), availableScale), 0.5, 1.75);
+}
+
+wchar_t matchingRightGrouping(wchar_t opening) {
+    switch (opening) {
+    case L'(':
+        return L')';
+    case L'（':
+        return L'）';
+    case L'[':
+        return L']';
+    case L'［':
+        return L'］';
+    case L'【':
+        return L'】';
+    case L'{':
+        return L'}';
+    case L'｛':
+        return L'｝';
+    default:
+        return L'\0';
+    }
+}
+
+bool isRightGrouping(wchar_t value) {
+    return value == L')' || value == L'）' || value == L']' || value == L'］' || value == L'】' ||
+           value == L'}' || value == L'｝';
+}
+
+std::wstring windowText(HWND window) {
+    const int length = GetWindowTextLengthW(window);
+    std::wstring text(static_cast<size_t>(length) + 1, L'\0');
+    GetWindowTextW(window, text.data(), length + 1);
+    text.resize(static_cast<size_t>(length));
+    return text;
+}
+
+LRESULT CALLBACK equationInputSubclassProc(HWND edit, UINT message, WPARAM wParam, LPARAM lParam,
+                                           UINT_PTR subclassId, DWORD_PTR) {
+    if (message == WM_CHAR) {
+        DWORD selectionStart = 0;
+        DWORD selectionEnd = 0;
+        SendMessageW(edit, EM_GETSEL, reinterpret_cast<WPARAM>(&selectionStart),
+                     reinterpret_cast<LPARAM>(&selectionEnd));
+        const wchar_t typed = static_cast<wchar_t>(wParam);
+        const std::wstring current = windowText(edit);
+
+        if (const wchar_t closing = matchingRightGrouping(typed)) {
+            std::wstring replacement;
+            replacement += typed;
+            if (selectionEnd > selectionStart && selectionEnd <= current.size())
+                replacement += current.substr(selectionStart, selectionEnd - selectionStart);
+            replacement += closing;
+            SendMessageW(edit, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(replacement.c_str()));
+            const DWORD caret = selectionEnd > selectionStart
+                                    ? selectionStart + static_cast<DWORD>(replacement.size())
+                                    : selectionStart + 1;
+            SendMessageW(edit, EM_SETSEL, caret, caret);
+            return 0;
+        }
+
+        if (isRightGrouping(typed) && selectionStart == selectionEnd && selectionStart < current.size() &&
+            current[selectionStart] == typed) {
+            SendMessageW(edit, EM_SETSEL, selectionStart + 1, selectionStart + 1);
+            return 0;
+        }
+
+        if (typed == L'\b' && selectionStart == selectionEnd && selectionStart > 0 &&
+            selectionStart < current.size() &&
+            matchingRightGrouping(current[selectionStart - 1]) == current[selectionStart]) {
+            SendMessageW(edit, EM_SETSEL, selectionStart - 1, selectionStart + 1);
+            SendMessageW(edit, EM_REPLACESEL, TRUE, reinterpret_cast<LPARAM>(L""));
+            return 0;
+        }
+    } else if (message == WM_NCDESTROY) {
+        RemoveWindowSubclass(edit, equationInputSubclassProc, subclassId);
+    }
+    return DefSubclassProc(edit, message, wParam, lParam);
 }
 
 enum class Language { Simplified, English, Traditional };
@@ -100,8 +177,8 @@ constexpr std::array<TypeInfo, 11> kTypes{
       L"Enter one equation per line, or separate them with semicolons", L"2x+y=7\r\nx-y=2"},
      {L"一元二次方程", L"Quadratic equation", L"使用 ^2 或 ² 表示平方；支持实根和复数根",
       L"Use ^2 or ²; real and complex roots are supported", L"x^2-2x-1=0"},
-     {L"二元二次方程组", L"2-variable quadratic system", L"输入两行总次数不超过 2 的方程，求全部实数解",
-      L"Enter two equations of total degree at most 2 to find every real solution", L"x^2+y^2=5\r\nx-y=1"},
+     {L"二元多项式方程组", L"2-variable polynomial system", L"输入两行总次数不超过 4 的方程，求全部实数解",
+      L"Enter two equations of total degree at most 4 to find every real solution", L"x^2+y^2=5\r\nx-y=1"},
      {L"一元三次方程", L"Cubic equation", L"支持因式分解、综合除法以及实根和复数根",
       L"Supports factorization, synthetic division, and real or complex roots", L"x^3-6x^2+11x-6=0"},
      {L"一元四次方程", L"Quartic equation", L"支持双二次换元、因式分解以及费拉里精确公式",
@@ -128,8 +205,8 @@ void replaceAll(std::wstring& text, const std::wstring& from, const std::wstring
 
 std::wstring multiplicationForDisplay(std::wstring text) {
     std::replace(text.begin(), text.end(), L'*', L'×');
-    static constexpr std::array<wchar_t, 10> superscriptDigits{
-        L'⁰', L'¹', L'²', L'³', L'⁴', L'⁵', L'⁶', L'⁷', L'⁸', L'⁹'};
+    static constexpr std::array<wchar_t, 10> superscriptDigits{L'⁰', L'¹', L'²', L'³', L'⁴',
+                                                               L'⁵', L'⁶', L'⁷', L'⁸', L'⁹'};
     std::wstring result;
     result.reserve(text.size());
     for (size_t index = 0; index < text.size();) {
@@ -179,6 +256,63 @@ std::wstring toEnglish(std::wstring text) {
         {L"把 i 作为虚数单位（i² = -1），对复系数增广矩阵进行高斯消元",
          L"Treat i as the imaginary unit (i² = -1) and apply Gaussian elimination to the complex augmented "
          L"matrix"},
+        {L"答案过长，仅显示近似值：", L"The exact answer is too long; showing approximate values only: "},
+        {L"目标：先找到一个容易计算的根，就能把三次或四次方程降低一次。",
+         L"Goal: first find a root that is easy to calculate, which reduces a cubic or quartic equation by "
+         L"one degree."},
+        {L"有理根定理：候选根可写成 ±p/q，p 是常数项的因数，q 是最高次项系数的因数。",
+         L"The rational root theorem says that a candidate root has the form ±p/q, where p is a factor of "
+         L"the constant term and q is a factor of the leading coefficient."},
+        {L"乘积等于 0 时，至少一个因式等于 0。现在只需解最后的低次方程：",
+         L"When a product equals 0, at least one factor equals 0. Now solve only the final lower-degree "
+         L"equation:"},
+        {L"综合除法是“除以 x - r”的简写算法。只写系数，每次按“落下、相乘、相加”计算。",
+         L"Synthetic division is a shorthand for division by x - r. Write only the coefficients and repeat "
+         L"the three actions: bring down, multiply, and add."},
+        {L"这是一元二次方程，先算 Δ = b² - 4ac，再使用 x = (-b ± √Δ)/(2a)。",
+         L"This is a quadratic equation. First calculate Δ = b² - 4ac, then use x = (-b ± √Δ)/(2a)."},
+        {L"这是一元一次方程，把常数项移到右边，再除以 x 的系数。",
+         L"This is a linear equation. Move the constant term to the right, then divide by the coefficient of "
+         L"x."},
+        {L"目标：把四次式拆成两个二次式，然后用熟悉的二次方程求根公式。",
+         L"Goal: split the quartic into two quadratics, then use the familiar quadratic formula."},
+        {L"为了把它配成两个二次因式，引入辅助数 m；m 不是原方程的答案。",
+         L"Introduce an auxiliary number m so the expression can be written as two quadratic factors; m is "
+         L"not an answer to the original equation."},
+        {L"因为 x⁴ = (x²)²，先把 x² 看成一个整体，四次方程就会变成熟悉的二次方程。",
+         L"Because x⁴ = (x²)², treat x² as one quantity so the quartic becomes a familiar quadratic."},
+        {L"思路：先用平移换元去掉二次项，再把新未知数拆成两个数的和。",
+         L"Idea: first remove the quadratic term by a translation, then split the new unknown into a sum of "
+         L"two numbers."},
+        {L"从绝对值较小的候选数开始代入，取 x = ",
+         L"Start with candidates of smaller absolute value and take x = "},
+        {L"代入后结果为 0，所以 x = ", L"The substituted result is 0, so x = "},
+        {L" 是根。根据因式定理，P", L" is a root. By the factor theorem, P"},
+        {L" 含有因式 ", L" contains the factor "},
+        {L"除去这个因式，得到低一次的多项式：",
+         L"After removing this factor, the polynomial of one lower degree is:"},
+        {L"原方程因此可写成：", L"Therefore the original equation can be written as:"},
+        {L"合并前面找到的根与低次方程的根，就得到原方程的全部根。",
+         L"Combine the roots found above with the roots of the lower-degree equation to obtain all roots of "
+         L"the original equation."},
+        {L"合并综合除法得到的根与最后低次方程的根，即为原方程的全部根。",
+         L"Combine the roots from synthetic division with the roots of the final lower-degree equation to "
+         L"obtain all roots of the original equation."},
+        {L"原系数（按降幂排列）：", L"Original coefficients (in descending powers): "},
+        {L"先落下首项系数 ", L"First bring down the leading coefficient "},
+        {L"余数为 0，说明可以整除。商的系数为：",
+         L"The remainder is 0, so the division is exact. The quotient coefficients are: "},
+        {L"第 1 步：对当前多项式 P", L"Step 1: find a rational root of the current polynomial P"},
+        {L"第 2 步：对当前多项式 P", L"Step 2: find a rational root of the current polynomial P"},
+        {L"第 3 步：对当前多项式 P", L"Step 3: find a rational root of the current polynomial P"},
+        {L"步：对当前多项式 P", L"Step: find a rational root of the current polynomial P"},
+        {L" 寻找有理根。", L"."},
+        {L"p 可取：", L"Possible p values: "},
+        {L"；q 可取：", L"; possible q values: "},
+        {L"解得：", L"Solutions: "},
+        {L"因此：", L"Therefore: "},
+        {L"降次后得到：", L"After reducing the degree, obtain: "},
+        {L"（余数）", L" (remainder)"},
         {L"把 i 作为虚数单位（i² = -1），移项、通分并合并同类项",
          L"Treat i as the imaginary unit (i² = -1), rearrange, use a common denominator, and combine like "
          L"terms"},
@@ -187,17 +321,19 @@ std::wstring toEnglish(std::wstring text) {
         {L"把 i 作为虚数单位（i² = -1），高斯消元后存在自由变量",
          L"Treat i as the imaginary unit (i² = -1). Free variables remain after Gaussian elimination"},
         {L"输入原方程组", L"Original system"},
-        {L"二元二次方程组需要输入两行方程",
-         L"A two-variable quadratic system requires exactly two equation lines"},
-        {L"二元二次方程组暂不支持分数指数",
-         L"Fractional exponents are not currently supported in a two-variable quadratic system"},
-        {L"二元二次方程组暂不支持未知数位于分母",
-         L"Variables in denominators are not currently supported in a two-variable quadratic system"},
-        {L"二元二次方程组只能包含两个未知数",
-         L"A two-variable quadratic system can contain only two unknowns"},
-        {L"二元二次方程组必须包含两个未知数", L"A two-variable quadratic system must contain two unknowns"},
-        {L"二元二次方程组中每个方程的总次数不能超过 2",
-         L"Each equation in a two-variable quadratic system must have total degree at most 2"},
+        {L"二元多项式方程组需要输入两行方程",
+         L"A two-variable polynomial system requires exactly two equation lines"},
+        {L"二元多项式方程组暂不支持分数指数",
+         L"Fractional exponents are not currently supported in a two-variable polynomial system"},
+        {L"二元多项式方程组暂不支持未知数位于分母",
+         L"Variables in denominators are not currently supported in a two-variable polynomial system"},
+        {L"二元多项式方程组只能包含两个未知数",
+         L"A two-variable polynomial system can contain only two unknowns"},
+        {L"二元多项式方程组必须包含两个未知数",
+         L"A two-variable polynomial system must contain two unknowns"},
+        {L"二元多项式方程组目前支持每个未知数次数及总次数不超过 4",
+         L"A two-variable polynomial system currently supports degree at most 4 in each variable and in "
+         L"total"},
         {L"方程组中的每一行都必须使用等号 =", L"Every line in a system must use the equals sign ="},
         {L"化简后两个方程均为一次方程，转入二元一次方程组求解。",
          L"After simplification both equations are linear, so solve them as a two-variable linear system."},
@@ -208,11 +344,23 @@ std::wstring toEnglish(std::wstring text) {
          L"solutions."},
         {L"该结式没有产生同时满足两个原方程的实数坐标。",
          L"The resultant produces no real coordinates satisfying both original equations."},
-        {L"把两个方程都看成关于 y 的二次多项式，计算结式并消去 y：",
-         L"Regard both equations as quadratic polynomials in y, calculate the resultant, and eliminate y:"},
-        {L"解出所有实数 x，再逐一回代求 y，并舍去不同时满足两式的候选点。",
-         L"Solve for every real x, substitute each one back to find y, and reject candidates that do not "
-         L"satisfy both equations."},
+        {L"把两个方程都看成关于 y 的多项式，建立 Sylvester 矩阵并计算结式以消去 y：",
+         L"Regard both equations as polynomials in y, build the Sylvester matrix, and calculate the "
+         L"resultant "
+         L"to eliminate y:"},
+        {L"求出结式的全部实根 x；每个 x 都要回代原方程，排除结式引入的伪根。",
+         L"Find every real root x of the resultant; substitute each one into the original equations to "
+         L"reject "
+         L"extraneous roots introduced by elimination."},
+        {L"先把两个方程展开并写成左边为多项式、右边为 0 的标准式：",
+         L"Expand both equations and write them in standard form with a polynomial on the left and 0 on the "
+         L"right:"},
+        {L"对结式得到的每个 x，优先代入关于 y 次数较低的方程求出全部实数 y；再将每个候选坐标同时代入 "
+         L"(1)、(2)，只有两式残差均在允许范围内才保留。",
+         L"For each x from the resultant, substitute first into the equation of lower degree in y to obtain "
+         L"all "
+         L"real y values. Keep a candidate only when substitution into both (1) and (2) gives acceptable "
+         L"residuals."},
         {L"将两式按相应二次项系数配倍相减，消去一个二次项；再把降次关系代回任一原方程。",
          L"Scale and subtract the equations to eliminate a quadratic term, then substitute the reduced "
          L"relation into either original equation."},
@@ -232,6 +380,8 @@ std::wstring toEnglish(std::wstring text) {
         {L"第 2 组：取 x ", L"Solution 2: take x "},
         {L"第 3 组：取 x ", L"Solution 3: take x "},
         {L"第 4 组：取 x ", L"Solution 4: take x "},
+        {L"第 5 组：取 x ", L"Solution 5: take x "},
+        {L"第 6 组：取 x ", L"Solution 6: take x "},
         {L"组：取 x ", L": take x "},
         {L"用 (", L"Use ("},
         {L"，消去 ", L" to eliminate "},
@@ -241,8 +391,10 @@ std::wstring toEnglish(std::wstring text) {
          L": substituting into both original equations makes their two sides equal."},
         {L"方法一：结式消元法", L"Method 1: elimination by resultant"},
         {L"方法二：加减消元与代入法", L"Method 2: addition/subtraction elimination and substitution"},
-        {L"结论：二元二次方程组无实数解",
-         L"Conclusion: the two-variable quadratic system has no real solution"},
+        {L"方法二：逐根回代与双式验算法", L"Method 2: root-by-root substitution and verification"},
+        {L"回代次数较低的方程，解得 y ", L"substitute into the lower-degree equation to obtain y "},
+        {L"结论：二元多项式方程组无实数解",
+         L"Conclusion: the two-variable polynomial system has no real solution"},
         {L"结论：方程组有无穷多个实数解", L"Conclusion: the system has infinitely many real solutions"},
         {L"方程最高次项系数不能为 0", L"The leading coefficient cannot be zero"},
         {L"该分支为三次或四次方程，使用精确代数公式求根并保留分数与根式。",
@@ -266,12 +418,9 @@ std::wstring toEnglish(std::wstring text) {
         {L"按降幂顺序写出系数，并对每个有理根执行“首项落下、乘根、与下一项相加”：",
          L"Write the coefficients in descending powers. For each rational root, bring down the leading "
          L"coefficient, multiply by the root, and add to the next coefficient:"},
-        {L"第 1 次综合除法，使用根 r = ",
-         L"Synthetic-division step 1, using root r = "},
-        {L"第 2 次综合除法，使用根 r = ",
-         L"Synthetic-division step 2, using root r = "},
-        {L"第 3 次综合除法，使用根 r = ",
-         L"Synthetic-division step 3, using root r = "},
+        {L"第 1 次综合除法，使用根 r = ", L"Synthetic-division step 1, using root r = "},
+        {L"第 2 次综合除法，使用根 r = ", L"Synthetic-division step 2, using root r = "},
+        {L"第 3 次综合除法，使用根 r = ", L"Synthetic-division step 3, using root r = "},
         {L"次综合除法，使用根 r = ", L" synthetic-division step, using root r = "},
         {L"降次后得到 ", L"After reducing the degree, obtain "},
         {L"对这个二次方程计算判别式并使用求根公式；",
@@ -304,8 +453,7 @@ std::wstring toEnglish(std::wstring text) {
          L"0，所得四个精确根与方法一一致。",
          L"Treat the depressed quartic as a quadratic in y² and factor it into two expressions in y². "
          L"Setting each factor to zero gives the same four exact roots as Method 1."},
-        {L"对每个 t 解 y² = t，最后由 x = y + (",
-         L"For each t, solve y² = t, then use x = y + ("},
+        {L"对每个 t 解 y² = t，最后由 x = y + (", L"For each t, solve y² = t, then use x = y + ("},
         {L") 还原并保留精确根式。", L") to recover x while retaining exact radicals."},
         {L"根据上面两个 t 根，降幂四次式可直接写成：",
          L"Using the two t-roots above, write the depressed quartic directly as:"},
@@ -323,8 +471,7 @@ std::wstring toEnglish(std::wstring text) {
          L" and substitute it into the four exact radical expressions shown in the result."},
         {L"把四次式配成两个二次式后，两个判别式分别为：",
          L"After completing the quartic into two quadratics, their discriminants are:"},
-        {L"代入二次方程求根公式，并由 x = y + (",
-         L"Apply the quadratic formula, then use x = y + ("},
+        {L"代入二次方程求根公式，并由 x = y + (", L"Apply the quadratic formula, then use x = y + ("},
         {L") 还原，得到结果中的四个精确根式。",
          L") to recover the four exact radical roots shown in the result."},
         {L"设 y⁴ + py² + qy + r = (y² + sy + t)(y² - sy + u)。",
@@ -334,8 +481,7 @@ std::wstring toEnglish(std::wstring text) {
         {L"因此原式分解为：", L"Therefore the expression factors as:"},
         {L"分别解两个二次方程：", L"Solve the two quadratic equations separately:"},
         {L"最后由 x = y + (", L"Finally, use x = y + ("},
-        {L") 还原，四个根与费拉里法一致。",
-         L") to recover x; the four roots agree with Ferrari's method."},
+        {L") 还原，四个根与费拉里法一致。", L") to recover x; the four roots agree with Ferrari's method."},
         {L"由 s = ", L"From s = "},
         {L" 解得：", L", obtain:"},
         {L"把降幂四次式分解为 (y² + sy + t)(y² - sy + "
@@ -352,8 +498,7 @@ std::wstring toEnglish(std::wstring text) {
         {L"并取上面算出的 A、B。", L"and use the A and B calculated above."},
         {L"令 ω = (-1 + √3i)/2，则 ω³ = 1 且 1 + ω + ω² = 0。",
          L"Let ω = (-1 + √3i)/2; then ω³ = 1 and 1 + ω + ω² = 0."},
-        {L"三组配对必须保持乘积 AB = -p/3：",
-         L"The three pairings must preserve the product AB = -p/3:"},
+        {L"三组配对必须保持乘积 AB = -p/3：", L"The three pairings must preserve the product AB = -p/3:"},
         {L"最后由 x = u + (", L"Finally, use x = u + ("},
         {L") 分别还原，得到方法一中的一实根和一对共轭复根。",
          L") to recover each root, giving the real root and conjugate complex pair from Method 1."},
@@ -365,12 +510,10 @@ std::wstring toEnglish(std::wstring text) {
          L"2π/3 to obtain the same three real roots."},
         {L"在降幂方程中令 u = 2√(-p/3)·cos φ，代入并提取公因子后得到：",
          L"In the depressed cubic, let u = 2√(-p/3)·cos φ. Substitute and factor to obtain:"},
-        {L"利用 cos(3φ) = 4cos³φ - 3cosφ，取 θ = acos(",
-         L"Using cos(3φ) = 4cos³φ - 3cosφ, let θ = acos("},
+        {L"利用 cos(3φ) = 4cos³φ - 3cosφ，取 θ = acos(", L"Using cos(3φ) = 4cos³φ - 3cosφ, let θ = acos("},
         {L"把三个 φ 依次代回 u，再由 x = u + (",
          L"Substitute the three values of φ into u, then use x = u + ("},
-        {L") 还原，得到与方法一相同的三个实根。",
-         L") to recover the same three real roots as Method 1."},
+        {L") 还原，得到与方法一相同的三个实根。", L") to recover the same three real roots as Method 1."},
         {L"判别量 D = ", L"Discriminant quantity D = "},
         {L"令 x = u ", L"Let x = u "},
         {L"令 x = y ", L"Let x = y "},
@@ -706,6 +849,7 @@ std::wstring toEnglish(std::wstring text) {
         {L"分式方程无实数解", L"The rational equation has no real solution"},
         {L"方程无实数解", L"The equation has no real solution"},
         {L"三元一次方程组", L"3-variable linear system"},
+        {L"二元多项式方程组", L"2-variable polynomial system"},
         {L"二元二次方程组", L"2-variable quadratic system"},
         {L"二元一次方程组", L"2-variable linear system"},
         {L"一元四次方程", L"Quartic equation"},
@@ -1081,6 +1225,32 @@ std::optional<std::wstring> terminatingDecimal(std::wstring expression) {
     return result;
 }
 
+std::wstring solutionSubscript(size_t value) {
+    static constexpr std::array<wchar_t, 10> digits{L'₀', L'₁', L'₂', L'₃', L'₄',
+                                                    L'₅', L'₆', L'₇', L'₈', L'₉'};
+    std::wstring result;
+    do {
+        result.insert(result.begin(), digits[value % 10]);
+        value /= 10;
+    } while (value > 0);
+    return result;
+}
+
+std::vector<std::wstring> solutionValueLabels() {
+    std::vector<std::wstring> labels;
+    labels.reserve(67);
+    for (const wchar_t variable : {L'x', L'y'}) {
+        for (size_t index = 1; index <= 16; ++index)
+            labels.push_back(std::wstring(1, variable) + solutionSubscript(index));
+    }
+    for (const wchar_t variable : {L'x', L'y'}) {
+        for (size_t index = 1; index <= 16; ++index)
+            labels.push_back(std::wstring(1, variable) + std::to_wstring(index));
+    }
+    labels.insert(labels.end(), {L"x", L"y", L"z"});
+    return labels;
+}
+
 std::wstring approximationForSummary(const std::wstring& summary,
                                      equation::AngleUnit angleUnit = equation::AngleUnit::Radians) {
     if (summary.find(L'≈') != std::wstring::npos ||
@@ -1106,11 +1276,7 @@ std::wstring approximationForSummary(const std::wstring& summary,
     };
     std::vector<Item> items;
     std::set<size_t> usedPositions;
-    const std::array<const wchar_t*, 19> labels{L"x₁", L"x₂", L"x₃", L"x₄", L"y₁", L"y₂", L"y₃",
-                                                L"y₄", L"x1", L"x2", L"x3", L"x4", L"y1", L"y2",
-                                                L"y3", L"y4", L"x",  L"y",  L"z"};
-    for (const wchar_t* rawLabel : labels) {
-        const std::wstring label(rawLabel);
+    for (const std::wstring& label : solutionValueLabels()) {
         const std::wstring pattern = label + L" = ";
         size_t search = 0;
         while ((search = summary.find(pattern, search)) != std::wstring::npos) {
@@ -1181,11 +1347,7 @@ std::vector<std::pair<std::wstring, double>> realValuesForGraph(const std::wstri
     };
     std::vector<Item> items;
     std::set<size_t> used;
-    const std::array<const wchar_t*, 19> labels{L"x₁", L"x₂", L"x₃", L"x₄", L"y₁", L"y₂", L"y₃",
-                                                L"y₄", L"x1", L"x2", L"x3", L"x4", L"y1", L"y2",
-                                                L"y3", L"y4", L"x",  L"y",  L"z"};
-    for (const wchar_t* rawLabel : labels) {
-        const std::wstring label(rawLabel);
+    for (const std::wstring& label : solutionValueLabels()) {
         for (const std::wstring relation : {L" = ", L" ≈ "}) {
             const std::wstring pattern = label + relation;
             size_t search = 0;
@@ -1396,8 +1558,9 @@ class SolverApp {
             monitorInfo.rcWork.left + (monitorInfo.rcWork.right - monitorInfo.rcWork.left - windowWidth) / 2;
         const int windowY =
             monitorInfo.rcWork.top + (monitorInfo.rcWork.bottom - monitorInfo.rcWork.top - windowHeight) / 2;
-        window_ = CreateWindowExW(0, kWindowClass, L"方程求解器", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-                                  windowX, windowY, windowWidth, windowHeight, nullptr, nullptr, instance_, this);
+        window_ =
+            CreateWindowExW(0, kWindowClass, L"方程求解器", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, windowX,
+                            windowY, windowWidth, windowHeight, nullptr, nullptr, instance_, this);
         if (!window_)
             return false;
         ShowWindow(window_, showCommand);
@@ -1514,9 +1677,8 @@ class SolverApp {
         info.cbSize = sizeof(info);
         if (!GetMonitorInfoW(monitor, &info))
             return false;
-        const double nextScale =
-            displayScaleForWorkArea(info.rcWork.right - info.rcWork.left,
-                                    info.rcWork.bottom - info.rcWork.top, dpi ? dpi : 96);
+        const double nextScale = displayScaleForWorkArea(
+            info.rcWork.right - info.rcWork.left, info.rcWork.bottom - info.rcWork.top, dpi ? dpi : 96);
         const bool changed = std::abs(nextScale - uiScale_) > 0.005 || currentDpi_ != dpi;
         uiScale_ = nextScale;
         currentDpi_ = dpi ? dpi : 96;
@@ -1556,10 +1718,10 @@ class SolverApp {
         const int workTop = static_cast<int>(info.rcWork.top);
         const int workRight = static_cast<int>(info.rcWork.right);
         const int workBottom = static_cast<int>(info.rcWork.bottom);
-        const int windowX = std::clamp(centerX - windowWidth / 2, workLeft,
-                                       std::max(workLeft, workRight - windowWidth));
-        const int windowY = std::clamp(centerY - windowHeight / 2, workTop,
-                                       std::max(workTop, workBottom - windowHeight));
+        const int windowX =
+            std::clamp(centerX - windowWidth / 2, workLeft, std::max(workLeft, workRight - windowWidth));
+        const int windowY =
+            std::clamp(centerY - windowHeight / 2, workTop, std::max(workTop, workBottom - windowHeight));
         SetWindowPos(window_, nullptr, windowX, windowY, windowWidth, windowHeight,
                      SWP_NOZORDER | SWP_NOACTIVATE);
         layoutControls();
@@ -1567,19 +1729,37 @@ class SolverApp {
 
     HFONT createAppFont(int designHeight, int minimumHeight, int weight) const {
         const int height = std::max(minimumHeight, scaled(designHeight));
-        return CreateFontW(-height, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                           OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH,
-                           L"Microsoft YaHei UI");
+        return CreateFontW(-height, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                           CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
     }
 
     void applyFontsToControls() {
-        for (HWND control :
-             {title_,          subtitle_,       languageCombo_, themeButton_,     typeLabel_,
-              typeCombo_,      angleUnitButton_, hint_,          inputLabel_,      inputFrame_,
-              input_,          syntaxTitle_,     syntax_,        exampleButton_,   clearButton_,
-              solveButton_,    resultTitle_,     graphButton_,   historyButton_,   resultSummary_,
-              approximation_,  methodLabel_,     methodButtons_[0], methodButtons_[1],
-              methodButtons_[2], process_}) {
+        for (HWND control : {title_,
+                             subtitle_,
+                             languageCombo_,
+                             themeButton_,
+                             typeLabel_,
+                             typeCombo_,
+                             angleUnitButton_,
+                             hint_,
+                             inputLabel_,
+                             inputFrame_,
+                             input_,
+                             syntaxTitle_,
+                             syntax_,
+                             exampleButton_,
+                             clearButton_,
+                             solveButton_,
+                             resultTitle_,
+                             graphButton_,
+                             historyButton_,
+                             resultSummary_,
+                             approximation_,
+                             methodLabel_,
+                             methodButtons_[0],
+                             methodButtons_[1],
+                             methodButtons_[2],
+                             process_}) {
             if (control)
                 SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(normalFont_), TRUE);
         }
@@ -1671,6 +1851,7 @@ class SolverApp {
         input_ = makeControl(L"EDIT", kTypes[0].example,
                              ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_TABSTOP, kEquationInputId);
         SendMessageW(input_, EM_SETLIMITTEXT, 4096, 0);
+        SetWindowSubclass(input_, equationInputSubclassProc, kEquationInputSubclassId, 0);
         syntaxTitle_ = makeControl(L"STATIC", L"输入说明", SS_LEFT);
         syntax_ = makeControl(mathview::kClassName, L"",
                               WS_TABSTOP | mathview::kVerticalScroll | mathview::kPlainText);
@@ -1743,7 +1924,7 @@ class SolverApp {
                                    classified.find(L"yx") != std::wstring::npos ||
                                    classified.find(L"x*y") != std::wstring::npos ||
                                    classified.find(L"y*x") != std::wstring::npos;
-            return quadratic ? L"二元二次方程组" : L"二元一次方程组";
+            return quadratic ? L"二元多项式方程组" : L"二元一次方程组";
         }
         if (classified.find_first_of(L"<>≤≥") != std::wstring::npos)
             return L"一元一次不等式";
@@ -1863,11 +2044,11 @@ class SolverApp {
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | mathview::kVerticalScroll | mathview::kClickableLines,
             scaled(16), scaled(16), scaled(632), scaled(440), logWindow_,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLogEditId)), instance_, nullptr);
-        logClearButton_ = CreateWindowExW(
-            0, L"BUTTON", localize(L"清空日志", L"Clear History").c_str(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, scaled(16), scaled(470), scaled(130),
-            scaled(36), logWindow_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLogClearButtonId)),
-            instance_, nullptr);
+        logClearButton_ = CreateWindowExW(0, L"BUTTON", localize(L"清空日志", L"Clear History").c_str(),
+                                          WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, scaled(16),
+                                          scaled(470), scaled(130), scaled(36), logWindow_,
+                                          reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLogClearButtonId)),
+                                          instance_, nullptr);
         SendMessageW(logEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(normalFont_), TRUE);
         SendMessageW(logClearButton_, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont_), TRUE);
         updateHistoryWindow();
@@ -1879,12 +2060,16 @@ class SolverApp {
     std::vector<std::pair<double, double>> graphMarkers() const {
         std::vector<std::pair<double, double>> markers;
         if (lastGraphSystem2_) {
-            const std::array<const wchar_t*, 9> suffixes{L"", L"₁", L"₂", L"₃", L"₄", L"1", L"2", L"3", L"4"};
-            for (const wchar_t* suffix : suffixes) {
+            std::vector<std::wstring> suffixes{L""};
+            for (size_t index = 1; index <= 16; ++index)
+                suffixes.push_back(solutionSubscript(index));
+            for (size_t index = 1; index <= 16; ++index)
+                suffixes.push_back(std::to_wstring(index));
+            for (const std::wstring& suffix : suffixes) {
                 std::optional<double> x;
                 std::optional<double> y;
-                const std::wstring xLabel = L"x" + std::wstring(suffix);
-                const std::wstring yLabel = L"y" + std::wstring(suffix);
+                const std::wstring xLabel = L"x" + suffix;
+                const std::wstring yLabel = L"y" + suffix;
                 for (const auto& [label, value] : lastGraphValues_) {
                     if (label == xLabel)
                         x = value;
@@ -1978,10 +2163,9 @@ class SolverApp {
                                        window_, nullptr, instance_, this);
         if (!graphWindow_)
             return;
-        graphCanvas_ =
-            CreateWindowExW(0, graphview::kClassName, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP, scaled(14),
-                            scaled(14), graphWidth - scaled(56), graphHeight - scaled(78), graphWindow_,
-                            nullptr, instance_, nullptr);
+        graphCanvas_ = CreateWindowExW(0, graphview::kClassName, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                                       scaled(14), scaled(14), graphWidth - scaled(56),
+                                       graphHeight - scaled(78), graphWindow_, nullptr, instance_, nullptr);
         SendMessageW(graphCanvas_, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont_), TRUE);
         RECT client{};
         GetClientRect(graphWindow_, &client);
@@ -2045,8 +2229,8 @@ class SolverApp {
             static_cast<int>(items.size()) > visibleRows ? scaled(kDropdownScrollbarWidth) : 0;
         dropdownList_ = CreateWindowExW(
             0, L"LISTBOX", L"",
-            WS_CHILD | WS_VISIBLE | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT,
-            scaled(2), scaled(2), width - scaled(4) - scrollbarWidth, height - scaled(4), dropdownWindow_,
+            WS_CHILD | WS_VISIBLE | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT, scaled(2),
+            scaled(2), width - scaled(4) - scrollbarWidth, height - scaled(4), dropdownWindow_,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kDropdownListId)), instance_, nullptr);
         SendMessageW(dropdownList_, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont_), TRUE);
         SendMessageW(dropdownList_, LB_SETITEMHEIGHT, 0, rowHeight);
@@ -2055,8 +2239,7 @@ class SolverApp {
         SendMessageW(dropdownList_, LB_SETCURSEL, dropdownSelectedIndex_, 0);
         SendMessageW(dropdownList_, LB_SETTOPINDEX, std::max(0, dropdownSelectedIndex_ - visibleRows / 2), 0);
         SetWindowSubclass(dropdownList_, DropdownListProc, 1, reinterpret_cast<DWORD_PTR>(this));
-        HRGN region =
-            CreateRoundRectRgn(0, 0, width + 1, height + 1, scaled(10), scaled(10));
+        HRGN region = CreateRoundRectRgn(0, 0, width + 1, height + 1, scaled(10), scaled(10));
         SetWindowRgn(dropdownWindow_, region, TRUE);
         ShowWindow(dropdownWindow_, SW_SHOWNORMAL);
         SetFocus(dropdownList_);
@@ -2094,20 +2277,17 @@ class SolverApp {
     RECT dropdownThumbRect(HWND hwnd) const {
         const RECT bar = dropdownScrollbarRect(hwnd);
         const int arrowHeight = scaled(kDropdownArrowHeight);
-        const int trackHeight =
-            std::max(1, static_cast<int>(bar.bottom - bar.top) - 2 * arrowHeight);
+        const int trackHeight = std::max(1, static_cast<int>(bar.bottom - bar.top) - 2 * arrowHeight);
         const int maximum = dropdownMaxTopIndex();
-        const int thumbHeight =
-            maximum == 0
-                ? trackHeight
-                : std::max(scaled(kDropdownMinimumThumbHeight),
-                           trackHeight * dropdownVisibleRows_ /
-                               std::max(1, static_cast<int>(dropdownItems_.size())));
+        const int thumbHeight = maximum == 0
+                                    ? trackHeight
+                                    : std::max(scaled(kDropdownMinimumThumbHeight),
+                                               trackHeight * dropdownVisibleRows_ /
+                                                   std::max(1, static_cast<int>(dropdownItems_.size())));
         const int travel = std::max(0, trackHeight - thumbHeight);
         const int topIndex =
             dropdownList_ ? static_cast<int>(SendMessageW(dropdownList_, LB_GETTOPINDEX, 0, 0)) : 0;
-        const int thumbTop =
-            bar.top + arrowHeight + (maximum == 0 ? 0 : travel * topIndex / maximum);
+        const int thumbTop = bar.top + arrowHeight + (maximum == 0 ? 0 : travel * topIndex / maximum);
         return {bar.right - scaled(12), thumbTop, bar.right - scaled(4), thumbTop + thumbHeight};
     }
 
@@ -2226,21 +2406,22 @@ class SolverApp {
             L"• 未知数可用任意英文字母（e 除外）：a、t、u 等\r\n• 常数：pi 或 π 表示圆周率，e "
             L"表示自然常数\r\n• 三角函数：支持弧度制和角度制，可在题型旁切换\r\n• 阶乘：5! 或 5！\r\n• "
             L"括号层级：{ [ ( ) ] "
-            L"}；同种括号不能嵌套\r\n• 可省略乘号：2a、3(a+1)\r\n• 平方与平方根：a^2；\"100\"\r\n• "
+            L"}；同种括号不能嵌套；输入左括号会自动补全右括号\r\n• 可省略乘号：2a、3(a+1)\r\n• "
+            L"平方与平方根：a^2；\"100\"\r\n• "
             L"n 次根：\"n\"被开方数\"；其他指数幂：a^-2、a^(1/2)、a^(-2/3)\r\n• "
             L"绝对值：|a|；根号内也可用，如 "
             L"\"3\"|-2|\"\r\n• "
-            L"高次方程：a^3、a^4；二元二次方程组每行一个方程\r\n• 方程组每行一个方程",
+            L"高次方程：a^3、a^4；二元多项式方程组支持总次数不超过 4\r\n• 方程组每行一个方程",
             L"• Any English letter except e can be a variable: a, t, u, etc.\r\n• Constants: pi or π is the "
             L"circle constant; e is Euler's number\r\n• Trigonometric functions: switch between radians and "
             L"degrees beside the type selector\r\n• Factorial: 5! or 5！\r\n• Bracket order: { [ ( ) ] }; "
-            L"brackets of the same kind cannot be "
-            L"nested\r\n• Multiplication may be omitted: 2a, 3(a+1)\r\n• Square and square root: a^2; "
+            L"brackets of the same kind cannot be nested; typing a left bracket automatically inserts its "
+            L"right bracket\r\n• Multiplication may be omitted: 2a, 3(a+1)\r\n• Square and square root: a^2; "
             L"\"100\"\r\n• "
             L"nth root: \"n\"radicand\"; other exponents: a^-2, a^(1/2), a^(-2/3)\r\n• Absolute value: |a|; "
             L"also in "
-            L"roots, e.g. \"3\"|-2|\"\r\n• Higher-degree equations: a^3, a^4; enter one equation per line "
-            L"for a 2-variable quadratic system\r\n• Enter one equation per line for a system");
+            L"roots, e.g. \"3\"|-2|\"\r\n• Higher-degree equations: a^3, a^4; 2-variable polynomial systems "
+            L"support total degree at most 4\r\n• Enter one equation per line for a system");
         replaceAll(syntax, L"（e 除外）", L"（e、i 除外）");
         replaceAll(syntax, L"表示自然常数\r\n", L"表示自然常数，i 表示虚数单位（i² = -1）\r\n");
         replaceAll(syntax, L"except e can", L"except e and i can");
@@ -2271,6 +2452,9 @@ class SolverApp {
             return;
         currentType_ = index;
         const auto& type = kTypes[index];
+        // The custom popup is not a native combo box, so changing currentType_ does not update
+        // the button caption automatically. Refresh it as part of the same selection commit.
+        rebuildTypeCombo();
         SetWindowTextW(hint_, localize(type.hintSimplified, type.hintEnglish).c_str());
         SetWindowTextW(input_, type.example);
         lastSummaryZh_ = L"等待求解……";
@@ -2324,6 +2508,27 @@ class SolverApp {
         }
     }
 
+    bool answerIsTooLong(const std::wstring& summary) {
+        SetWindowTextW(resultSummary_, localizedSolverOutput(summary).c_str());
+        RECT client{};
+        GetClientRect(window_, &client);
+        const int margin = scaled(28);
+        const int leftWidth = std::clamp(static_cast<int>(client.right) * 38 / 100, scaled(350), scaled(460));
+        const int rightX = margin + leftWidth + scaled(24);
+        const int rightWidth = std::max(scaled(320), static_cast<int>(client.right) - rightX - margin);
+        const int naturalWidth = mathview::preferredWidth(resultSummary_);
+        // The result card is intentionally limited to two readable lines. Longer exact formulae
+        // become difficult to follow and can be clipped, so the compact numeric form is clearer.
+        return summary.size() > 220 || naturalWidth > rightWidth * 2;
+    }
+
+    static std::wstring longAnswerApproximation(std::wstring approximation) {
+        const std::wstring prefix = L"数值：";
+        if (approximation.rfind(prefix, 0) == 0)
+            approximation.erase(0, prefix.size());
+        return L"答案过长，仅显示近似值：" + approximation;
+    }
+
     void solve() {
         // 成功时集中刷新结果、解法、日志和图像；输入异常只更新错误区域。
         const std::wstring text = controlText(input_);
@@ -2333,6 +2538,14 @@ class SolverApp {
             lastSummaryZh_ = result.summary;
             lastApproximationZh_ = approximationForSummary(result.summary, angleUnit_);
             lastVariableContext_ = result;
+            if (answerIsTooLong(result.summary)) {
+                if (!lastApproximationZh_.empty()) {
+                    lastSummaryZh_ = longAnswerApproximation(lastApproximationZh_);
+                    lastApproximationZh_.clear();
+                } else if (result.summary.find(L'≈') != std::wstring::npos) {
+                    lastSummaryZh_ = L"答案过长，仅显示近似值：\r\n" + result.summary;
+                }
+            }
             splitMethods(result.process);
             int equationLines = 1;
             for (wchar_t ch : text)
@@ -2499,24 +2712,23 @@ class SolverApp {
         const int rightWidth = std::max(scaled(320), width - rightX - margin);
 
         MoveWindow(title_, margin, scaled(20), scaled(520), scaled(38), TRUE);
-        MoveWindow(subtitle_, margin, scaled(58),
-                   std::max(scaled(280), width - 2 * margin - scaled(245)), scaled(23), TRUE);
-        MoveWindow(languageCombo_, width - margin - scaled(210), scaled(24), scaled(138), scaled(34),
-                   TRUE);
+        MoveWindow(subtitle_, margin, scaled(58), std::max(scaled(280), width - 2 * margin - scaled(245)),
+                   scaled(23), TRUE);
+        MoveWindow(languageCombo_, width - margin - scaled(210), scaled(24), scaled(138), scaled(34), TRUE);
         MoveWindow(themeButton_, width - margin - scaled(62), scaled(26), scaled(62), scaled(30), TRUE);
         MoveWindow(typeLabel_, margin, scaled(101), scaled(70), scaled(25), TRUE);
         MoveWindow(typeCombo_, margin + scaled(72), scaled(96),
                    std::max(scaled(130), leftWidth - scaled(218)), scaled(34), TRUE);
-        MoveWindow(angleUnitButton_, margin + leftWidth - scaled(134), scaled(96), scaled(134),
-                   scaled(34), TRUE);
+        MoveWindow(angleUnitButton_, margin + leftWidth - scaled(134), scaled(96), scaled(134), scaled(34),
+                   TRUE);
         MoveWindow(hint_, margin, scaled(136), leftWidth, scaled(24), TRUE);
         MoveWindow(inputLabel_, margin, scaled(171), leftWidth, scaled(24), TRUE);
         MoveWindow(inputFrame_, margin, scaled(198), leftWidth, scaled(156), TRUE);
         MoveWindow(input_, margin + scaled(8), scaled(205), leftWidth - scaled(16), scaled(142), TRUE);
         MoveWindow(syntaxTitle_, margin, scaled(376), leftWidth, scaled(24), TRUE);
         const int buttonY = height - scaled(62);
-        MoveWindow(syntax_, margin, scaled(403), leftWidth,
-                   std::max(scaled(122), buttonY - scaled(415)), TRUE);
+        MoveWindow(syntax_, margin, scaled(403), leftWidth, std::max(scaled(122), buttonY - scaled(415)),
+                   TRUE);
         MoveWindow(exampleButton_, margin, buttonY, scaled(116), scaled(36), TRUE);
         MoveWindow(clearButton_, margin + scaled(128), buttonY, scaled(90), scaled(36), TRUE);
         MoveWindow(solveButton_, margin + scaled(232), buttonY,
@@ -2526,8 +2738,8 @@ class SolverApp {
                    scaled(27), TRUE);
         MoveWindow(graphButton_, rightX + rightWidth - scaled(226), scaled(94), scaled(100), scaled(34),
                    TRUE);
-        MoveWindow(historyButton_, rightX + rightWidth - scaled(118), scaled(94), scaled(118),
-                   scaled(34), TRUE);
+        MoveWindow(historyButton_, rightX + rightWidth - scaled(118), scaled(94), scaled(118), scaled(34),
+                   TRUE);
         std::wstring displayedSummary = localizedSolverOutput(lastSummaryZh_);
         bool twoLineSummary = naturalSummaryWidth > rightWidth;
         if (twoLineSummary) {
@@ -2536,7 +2748,12 @@ class SolverApp {
         }
         const bool expandedExactSummary = displayedSummary.find(L'∛') != std::wstring::npos ||
                                           displayedSummary.find(L"acos(") != std::wstring::npos;
-        const int maxSummaryLines = expandedExactSummary ? 6 : 2;
+        const wchar_t displayedVariable =
+            lastVariableContext_.variableCount > 0 ? lastVariableContext_.variables[0] : L'x';
+        const bool multiPointSystem =
+            lastGraphSystem2_ &&
+            displayedSummary.find(std::wstring(1, displayedVariable) + L"₃") != std::wstring::npos;
+        const int maxSummaryLines = expandedExactSummary || multiPointSystem ? 6 : 2;
         mathview::setMaxVisualLines(resultSummary_, maxSummaryLines);
         const int formattedWidth = mathview::preferredWidth(resultSummary_);
         const int summaryWidth =
@@ -2547,8 +2764,8 @@ class SolverApp {
         const bool multiple = methodSectionsZh_.size() > 1;
         int processTop = scaled(135) + summaryHeight + scaled(8);
         if (!lastApproximationZh_.empty()) {
-            MoveWindow(approximation_, rightX + scaled(4), processTop, rightWidth - scaled(8),
-                       scaled(24), TRUE);
+            MoveWindow(approximation_, rightX + scaled(4), processTop, rightWidth - scaled(8), scaled(24),
+                       TRUE);
             processTop += scaled(28);
         }
         if (multiple) {
@@ -2595,8 +2812,7 @@ class SolverApp {
             path.CloseFigure();
             graphics.FillPath(&trackBrush, &path);
             const int diameter = rect.bottom - scaled(6);
-            const int left =
-                darkMode_ ? rect.right - diameter - scaled(3) : scaled(3);
+            const int left = darkMode_ ? rect.right - diameter - scaled(3) : scaled(3);
             Gdiplus::SolidBrush knobBrush(Gdiplus::Color(255, 255, 255, 255));
             graphics.FillEllipse(&knobBrush, left, scaled(3), diameter, diameter);
             SetTextColor(dc, darkMode_ ? RGB(22, 134, 255) : RGB(105, 110, 118));
@@ -2635,10 +2851,8 @@ class SolverApp {
             }
             const Gdiplus::REAL left = scaledReal(1.0);
             const Gdiplus::REAL top = scaledReal(1.0);
-            const Gdiplus::REAL right =
-                static_cast<Gdiplus::REAL>(rect.right) - scaledReal(2.0);
-            const Gdiplus::REAL bottom =
-                static_cast<Gdiplus::REAL>(rect.bottom) - scaledReal(2.0);
+            const Gdiplus::REAL right = static_cast<Gdiplus::REAL>(rect.right) - scaledReal(2.0);
+            const Gdiplus::REAL bottom = static_cast<Gdiplus::REAL>(rect.bottom) - scaledReal(2.0);
             const Gdiplus::REAL diameter = optionBox ? scaledReal(8.0) : scaledReal(18.0);
             Gdiplus::GraphicsPath path;
             path.AddArc(left, top, diameter, diameter, 180.0f, 90.0f);
@@ -2779,8 +2993,7 @@ class SolverApp {
             POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             if (!PtInRect(&bar, point))
                 return 0;
-            const int topIndex =
-                static_cast<int>(SendMessageW(dropdownList_, LB_GETTOPINDEX, 0, 0));
+            const int topIndex = static_cast<int>(SendMessageW(dropdownList_, LB_GETTOPINDEX, 0, 0));
             const RECT thumb = dropdownThumbRect(hwnd);
             const int arrowHeight = scaled(kDropdownArrowHeight);
             if (point.y < bar.top + arrowHeight)
@@ -2802,14 +3015,12 @@ class SolverApp {
                 const RECT bar = dropdownScrollbarRect(hwnd);
                 const RECT thumb = dropdownThumbRect(hwnd);
                 const int arrowHeight = scaled(kDropdownArrowHeight);
-                const int trackHeight =
-                    std::max(1, static_cast<int>(bar.bottom - bar.top) - 2 * arrowHeight);
+                const int trackHeight = std::max(1, static_cast<int>(bar.bottom - bar.top) - 2 * arrowHeight);
                 const int travel = std::max(1, trackHeight - static_cast<int>(thumb.bottom - thumb.top));
                 const int mousePosition = static_cast<int>(GET_Y_LPARAM(lParam));
-                const int position =
-                    std::clamp(mousePosition - dropdownScrollbarDragOffset_ - static_cast<int>(bar.top) -
-                                   arrowHeight,
-                               0, travel);
+                const int position = std::clamp(mousePosition - dropdownScrollbarDragOffset_ -
+                                                    static_cast<int>(bar.top) - arrowHeight,
+                                                0, travel);
                 scrollDropdownTo(position * dropdownMaxTopIndex() / travel);
             }
             return 0;

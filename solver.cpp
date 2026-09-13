@@ -20,6 +20,13 @@ bool isZero(double value) {
     return std::abs(value) < kEpsilon;
 }
 
+int realRootPriority(double value) {
+    const double tolerance = 1e-8 * std::clamp(std::abs(value), 1.0, 10000.0);
+    if (std::abs(value - std::round(value)) <= tolerance)
+        return 0;
+    return value > 0.0 ? 1 : 2;
+}
+
 std::wstring relationText(Relation relation) {
     switch (relation) {
     case Relation::Less:
@@ -214,14 +221,20 @@ SolveResult solveQuadratic(double a, double b, double c) {
 
     if (delta > kEpsilon) {
         const double rootDelta = std::sqrt(delta);
-        const double x1 = (-b + rootDelta) / (2.0 * a);
-        const double x2 = (-b - rootDelta) / (2.0 * a);
+        double x1 = (-b + rootDelta) / (2.0 * a);
+        double x2 = (-b - rootDelta) / (2.0 * a);
+        const wchar_t* x1Operator = L"+";
+        const wchar_t* x2Operator = L"-";
+        if (realRootPriority(x2) < realRootPriority(x1)) {
+            std::swap(x1, x2);
+            std::swap(x1Operator, x2Operator);
+        }
         process << L"因为 Δ > 0，方程有两个不相等的实数根。\r\n"
                 << L"第 2 步：代入求根公式 x = (-b ± √Δ) / 2a：\r\n"
-                << L"    x₁ = (" << formatNumber(-b) << L" + √" << formatNumber(delta) << L") / "
-                << formatNumber(2 * a) << L" = " << formatNumber(x1) << L"\r\n"
-                << L"    x₂ = (" << formatNumber(-b) << L" - √" << formatNumber(delta) << L") / "
-                << formatNumber(2 * a) << L" = " << formatNumber(x2);
+                << L"    x₁ = (" << formatNumber(-b) << L" " << x1Operator << L" √" << formatNumber(delta)
+                << L") / " << formatNumber(2 * a) << L" = " << formatNumber(x1) << L"\r\n"
+                << L"    x₂ = (" << formatNumber(-b) << L" " << x2Operator << L" √" << formatNumber(delta)
+                << L") / " << formatNumber(2 * a) << L" = " << formatNumber(x2);
         return {L"两个实根：x₁ = " + formatNumber(x1) + L"，x₂ = " + formatNumber(x2), process.str()};
     }
 
