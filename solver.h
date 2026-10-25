@@ -19,6 +19,8 @@ struct SolveResult {
     std::wstring normalizedInput;
     // 含虚数单位的关系式不能绘制为普通实平面函数图像。
     bool usesImaginaryUnit = false;
+    // 含参数的关系式只输出等价表达式、定义域/分支或隐式解集，不展示过程。
+    bool isRelation = false;
 
     SolveResult() = default;
     SolveResult(std::wstring summaryText, std::wstring processText)

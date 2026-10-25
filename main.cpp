@@ -3,9 +3,11 @@
 
 #include "expression_parser.h"
 #include "graph_view.h"
+#include "history_store.h"
 #include "math_view.h"
 
 #include <commctrl.h>
+#include <commdlg.h>
 #include <dwmapi.h>
 #include <gdiplus.h>
 #include <uxtheme.h>
@@ -54,6 +56,8 @@ constexpr int kInputFrameId = 110;
 constexpr int kAngleUnitButtonId = 111;
 constexpr int kLogEditId = 112;
 constexpr int kDropdownListId = 113;
+constexpr int kLogImportId = 115;
+constexpr int kLogExportId = 116;
 constexpr int kMethodButtonBaseId = 200;
 constexpr int kDropdownScrollbarWidth = 16;
 constexpr int kDropdownArrowHeight = 16;
@@ -168,7 +172,7 @@ struct TypeInfo {
     const wchar_t* example;
 };
 
-constexpr std::array<TypeInfo, 11> kTypes{
+constexpr std::array<TypeInfo, 12> kTypes{
     {{L"自动识别", L"Auto detect", L"自动识别方程、不等式或多行方程组",
       L"Automatically detect equations, inequalities, or systems", L"1/(x-1)+1/(x+1)=1"},
      {L"一元一次方程", L"Linear equation", L"支持括号、数值分数和省略乘号",
@@ -190,8 +194,10 @@ constexpr std::array<TypeInfo, 11> kTypes{
      {L"分式方程", L"Rational equation", L"未知数可位于分母；自动列定义域并验根",
       L"Variables may appear in denominators; domain and roots are checked", L"1/(x-1)+1/(x+1)=1"},
      {L"三角方程", L"Trigonometric equation", L"支持弧度制和角度制以及 sin、cos、tan、cot 的周期通解",
-      L"Supports radians, degrees, and periodic solutions for sin, cos, tan, and cot", L"sin(x)=1/2"}}};
-static_assert(kTypes.size() == static_cast<size_t>(equation::InputKind::Trigonometric) + 1);
+      L"Supports radians, degrees, and periodic solutions for sin, cos, tan, and cot", L"sin(x)=1/2"},
+     {L"关系式求解", L"Rearrange relation", L"支持各类关系；给出显式表达式或精确隐式解集，不显示过程",
+      L"All relation types: explicit forms or exact implicit solution sets, without steps", L"a^2+b^2=1"}}};
+static_assert(kTypes.size() == static_cast<size_t>(equation::InputKind::Relation) + 1);
 
 void replaceAll(std::wstring& text, const std::wstring& from, const std::wstring& to) {
     if (from.empty())
@@ -250,6 +256,27 @@ std::wstring toTraditional(const std::wstring& text) {
 std::wstring toEnglish(std::wstring text) {
     // 求解过程含动态数学值，因此按“最长固定短语优先”替换，以保留公式内容。
     static const std::pair<const wchar_t*, const wchar_t*> replacements[] = {
+        {L"结论：定义域为空，无解", L"No solution: the domain is empty"},
+        {L"关系式过长，请缩短输入", L"The relation is too long; shorten the input"},
+        {L"请输入需要求解的关系式", L"Enter a relation to solve"},
+        {L"根号内的表达式无法解析", L"The expression inside the radical cannot be parsed"},
+        {L"根指数须为 2 至 64 的整数", L"The root index must be an integer from 2 to 64"},
+        {L"关系式中包含无法识别的表达式", L"The relation contains an unrecognized expression"},
+        {L"复数不能比较大小，含 i 的关系式请使用等号",
+         L"Complex numbers are unordered; use equality for a relation containing i"},
+        {L"请输入有效数字", L"Enter a valid number"},
+        {L"绝对值符号不匹配", L"Absolute-value delimiters do not match"},
+        {L"隐式解集", L"implicit solution set"},
+        {L" 有定义", L" is defined"},
+        {L"关系式求解只需输入一行等式", L"Enter a single equality to rearrange a relation"},
+        {L"关系式求解只支持等号 =", L"Rearranging a relation requires an equals sign (=)"},
+        {L"关系式求解目前只支持一次等式", L"Rearranging relations currently supports linear equalities"},
+        {L"关系式求解暂不支持未知数位于分母",
+         L"Rearranging relations does not yet support variables in denominators"},
+        {L"关系式求解暂不支持分数指数", L"Rearranging relations does not yet support fractional exponents"},
+        {L"关系式求解暂不支持虚数系数", L"Rearranging relations does not yet support complex coefficients"},
+        {L"结论：等式恒成立", L"The equality is always true"},
+        {L"关系式求解", L"Rearrange relation"},
         // Complete sentences and long phrases must be translated before their
         // shorter components.  This keeps dynamic mathematical values intact
         // while avoiding mixed output such as "row 2 步".
@@ -1374,123 +1401,7 @@ std::vector<std::pair<std::wstring, double>> realValuesForGraph(const std::wstri
     return result;
 }
 
-struct HistoryEntry {
-    std::wstring time;
-    std::wstring type;
-    std::wstring equation;
-};
-
-std::string wideToUtf8(const std::wstring& text) {
-    if (text.empty())
-        return {};
-    const int size = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0,
-                                         nullptr, nullptr);
-    std::string result(static_cast<size_t>(std::max(0, size)), '\0');
-    if (size > 0)
-        WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), result.data(), size,
-                            nullptr, nullptr);
-    return result;
-}
-
-std::wstring utf8ToWide(const std::string& text) {
-    if (text.empty())
-        return {};
-    const int size = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0);
-    std::wstring result(static_cast<size_t>(std::max(0, size)), L'\0');
-    if (size > 0)
-        MultiByteToWideChar(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), result.data(), size);
-    return result;
-}
-
-std::string escapeHistoryField(const std::wstring& text) {
-    const std::string utf8 = wideToUtf8(text);
-    std::string result;
-    result.reserve(utf8.size());
-    for (char ch : utf8) {
-        if (ch == '\\')
-            result += "\\\\";
-        else if (ch == '\t')
-            result += "\\t";
-        else if (ch == '\r')
-            result += "\\r";
-        else if (ch == '\n')
-            result += "\\n";
-        else
-            result += ch;
-    }
-    return result;
-}
-
-std::wstring unescapeHistoryField(const std::string& text) {
-    std::string result;
-    result.reserve(text.size());
-    for (size_t i = 0; i < text.size(); ++i) {
-        if (text[i] != '\\' || i + 1 >= text.size()) {
-            result += text[i];
-            continue;
-        }
-        const char next = text[++i];
-        if (next == 't')
-            result += '\t';
-        else if (next == 'r')
-            result += '\r';
-        else if (next == 'n')
-            result += '\n';
-        else
-            result += next;
-    }
-    return utf8ToWide(result);
-}
-
-std::filesystem::path historyFilePath() {
-    std::wstring base(32768, L'\0');
-    const DWORD count =
-        GetEnvironmentVariableW(L"LOCALAPPDATA", base.data(), static_cast<DWORD>(base.size()));
-    if (count == 0 || count >= base.size()) {
-        base.resize(MAX_PATH, L'\0');
-        const DWORD temporaryCount = GetTempPathW(static_cast<DWORD>(base.size()), base.data());
-        base.resize(temporaryCount > 0 && temporaryCount < base.size() ? temporaryCount : 0);
-    } else {
-        base.resize(count);
-    }
-    return std::filesystem::path(base) / L"EquationSolver" / L"history.tsv";
-}
-
-std::vector<HistoryEntry> loadHistory() {
-    std::vector<HistoryEntry> result;
-    try {
-        std::ifstream input(historyFilePath(), std::ios::binary);
-        std::string line;
-        while (std::getline(input, line)) {
-            const size_t first = line.find('\t');
-            const size_t second = first == std::string::npos ? std::string::npos : line.find('\t', first + 1);
-            if (first == std::string::npos || second == std::string::npos)
-                continue;
-            result.push_back({unescapeHistoryField(line.substr(0, first)),
-                              unescapeHistoryField(line.substr(first + 1, second - first - 1)),
-                              unescapeHistoryField(line.substr(second + 1))});
-        }
-    } catch (...) {
-        return {};
-    }
-    if (result.size() > 100)
-        result.erase(result.begin(), result.end() - 100);
-    return result;
-}
-
-void saveHistory(const std::vector<HistoryEntry>& history) {
-    try {
-        const auto path = historyFilePath();
-        std::filesystem::create_directories(path.parent_path());
-        std::ofstream output(path, std::ios::binary | std::ios::trunc);
-        for (const auto& entry : history) {
-            output << escapeHistoryField(entry.time) << '\t' << escapeHistoryField(entry.type) << '\t'
-                   << escapeHistoryField(entry.equation) << '\n';
-        }
-    } catch (...) {
-        // History persistence is non-critical; solving remains available.
-    }
-}
+using HistoryEntry = history::Entry;
 
 std::wstring currentTimestamp() {
     SYSTEMTIME time{};
@@ -1774,6 +1685,9 @@ class SolverApp {
             SendMessageW(logEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(normalFont_), TRUE);
         if (logClearButton_)
             SendMessageW(logClearButton_, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont_), TRUE);
+        for (HWND control : {logImportButton_, logExportButton_})
+            if (control)
+                SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont_), TRUE);
         if (graphCanvas_)
             SendMessageW(graphCanvas_, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont_), TRUE);
         if (dropdownList_)
@@ -1887,7 +1801,7 @@ class SolverApp {
         lastVariableContext_ = {};
         lastSolvedInput_.clear();
         methodSectionsZh_ = {L"输入原式后点击“开始求解”。"};
-        history_ = loadHistory();
+        initializeHistory();
         updateLanguage();
         applyTheme();
         layoutControls();
@@ -1903,6 +1817,8 @@ class SolverApp {
     }
 
     std::wstring historyTypeForInput(const std::wstring& text) const {
+        if (lastVariableContext_.isRelation)
+            return L"关系式求解";
         const std::wstring& classified = lastSolvedInput_.empty() ? text : lastSolvedInput_;
         if (currentType_ > 0 && currentType_ < static_cast<int>(kTypes.size())) {
             return kTypes[static_cast<size_t>(currentType_)].simplified;
@@ -1945,12 +1861,132 @@ class SolverApp {
         return L"一元一次方程";
     }
 
+    void initializeHistory() {
+        try {
+            historyStore_.emplace(history::defaultDirectory());
+            const auto startup = historyStore_->initialize(history::deviceFingerprint());
+            history_ = historyStore_->load();
+            historyReady_ = true;
+            historyWasReset_ = startup != history::Startup::ExistingDevice;
+        } catch (...) {
+            historyReady_ = false;
+        }
+    }
+
+    bool persistHistory(const std::vector<HistoryEntry>& entries) {
+        if (!historyReady_ || !historyStore_)
+            return false;
+        try {
+            historyStore_->save(entries);
+            return true;
+        } catch (...) {
+            historyReady_ = false;
+            updateHistoryWindow();
+            MessageBoxW(
+                logWindow_ ? logWindow_ : window_,
+                localize(L"日志未能保存。请检查数据目录权限或设备标记；本次会话的记录可通过导出另存。",
+                         L"History could not be saved. Check the data folder permissions or device marker. "
+                         L"You can export this session's records.")
+                    .c_str(),
+                localize(L"日志保存失败", L"History save failed").c_str(), MB_OK | MB_ICONWARNING);
+            return false;
+        }
+    }
+
     void addHistoryEntry(const std::wstring& equation) {
-        history_.push_back({currentTimestamp(), historyTypeForInput(equation), equation});
-        if (history_.size() > 100)
-            history_.erase(history_.begin(), history_.end() - 100);
-        saveHistory(history_);
+        history_ = history::merge(history_, {{currentTimestamp(), historyTypeForInput(equation), equation}});
+        persistHistory(history_);
         updateHistoryWindow();
+    }
+
+    std::optional<std::filesystem::path> chooseHistoryFile(bool exporting) {
+        std::wstring filename(32768, L'\0');
+        if (exporting) {
+            std::wstring timestamp = currentTimestamp();
+            std::replace(timestamp.begin(), timestamp.end(), L':', L'-');
+            std::replace(timestamp.begin(), timestamp.end(), L' ', L'_');
+            const std::wstring initial = L"EquationSolver-history-" + timestamp + L".tsv";
+            std::copy(initial.begin(), initial.end(), filename.begin());
+        }
+        std::wstring filter = localize(L"方程求解器日志 (*.tsv)", L"Equation Solver history (*.tsv)");
+        filter.push_back(L'\0');
+        filter += L"*.tsv";
+        filter.push_back(L'\0');
+        filter += localize(L"所有文件 (*.*)", L"All files (*.*)");
+        filter.push_back(L'\0');
+        filter += L"*.*";
+        filter.append(2, L'\0');
+        const std::wstring title = exporting ? localize(L"导出求解日志", L"Export solution history")
+                                             : localize(L"导入求解日志", L"Import solution history");
+        OPENFILENAMEW dialog{};
+        dialog.lStructSize = sizeof(dialog);
+        dialog.hwndOwner = logWindow_;
+        dialog.lpstrFilter = filter.c_str();
+        dialog.nFilterIndex = 1;
+        dialog.lpstrFile = filename.data();
+        dialog.nMaxFile = static_cast<DWORD>(filename.size());
+        dialog.lpstrTitle = title.c_str();
+        dialog.lpstrDefExt = L"tsv";
+        dialog.Flags = OFN_EXPLORER | OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST |
+                       (exporting ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST | OFN_HIDEREADONLY);
+        const BOOL selected = exporting ? GetSaveFileNameW(&dialog) : GetOpenFileNameW(&dialog);
+        if (selected)
+            return std::filesystem::path(filename.c_str());
+        if (CommDlgExtendedError())
+            MessageBoxW(logWindow_,
+                        localize(L"无法打开文件选择窗口，请重试。",
+                                 L"Could not open the file dialog. Please try again.")
+                            .c_str(),
+                        title.c_str(), MB_OK | MB_ICONERROR);
+        return std::nullopt;
+    }
+
+    void transferHistory(bool exporting) {
+        const auto path = chooseHistoryFile(exporting);
+        if (!path)
+            return;
+        try {
+            if (exporting) {
+                if (historyStore_)
+                    historyStore_->exportTo(*path, history_);
+                else
+                    history::writeBackup(*path, history_);
+                MessageBoxW(
+                    logWindow_,
+                    localize(L"日志已导出，包含方程、题型和原始求解时间。",
+                             L"History exported, including equations, types, and original solve times.")
+                        .c_str(),
+                    localize(L"导出完成", L"Export complete").c_str(), MB_OK | MB_ICONINFORMATION);
+            } else {
+                // 完整校验后再合并；先保存成功，再更新界面，防止半导入。
+                const auto incoming = history::readBackup(*path);
+                const auto merged = history::merge(history_, incoming);
+                if (!persistHistory(merged))
+                    return;
+                history_ = merged;
+                historyWasReset_ = false;
+                updateHistoryWindow();
+                const std::wstring message =
+                    localize(L"导入完成，已合并并去除重复记录，保留时间最新的 100 条。当前记录数：",
+                             L"Import complete. Records were merged and duplicates removed; the latest 100 "
+                             L"are kept. Current count: ") +
+                    std::to_wstring(history_.size());
+                MessageBoxW(logWindow_, message.c_str(), localize(L"导入完成", L"Import complete").c_str(),
+                            MB_OK | MB_ICONINFORMATION);
+            }
+        } catch (...) {
+            MessageBoxW(
+                logWindow_,
+                (exporting ? localize(L"导出失败。请选择程序数据目录以外的位置，并检查文件是否可写。",
+                                      L"Export failed. Choose a location outside the app data folder and "
+                                      L"check that the file is writable.")
+                           : localize(L"导入失败：文件无法读取、格式不正确或超过大小限制（8 MB / 10000 "
+                                      L"条）。现有日志未修改。",
+                                      L"Import failed: the file is unreadable, invalid, or exceeds the limit "
+                                      L"(8 MB / 10,000 entries). Existing history was not changed."))
+                    .c_str(),
+                localize(L"日志导入和导出", L"History import / export").c_str(), MB_OK | MB_ICONERROR);
+        }
     }
 
     std::wstring displayedHistory() {
@@ -1961,6 +1997,21 @@ class SolverApp {
             lines.push_back(line);
             historyLineTargets_.push_back(equation);
         };
+        if (!historyReady_) {
+            appendLine(
+                localize(L"本机识别或日志读取失败，已暂停日志读写。请检查设备标记和数据目录；当前会话记录仍可"
+                         L"导出。",
+                         L"Device verification or history loading failed. History storage is paused. Check "
+                         L"the device marker and data folder; this session can still be exported."),
+                L"");
+            appendLine(L"", L"");
+        } else if (historyWasReset_) {
+            appendLine(localize(L"未找到匹配的本机运行标记，旧使用记录已清空。可通过“导入日志”恢复备份。",
+                                L"No matching local run marker was found. Previous usage records were "
+                                L"cleared. Use Import history to restore a backup."),
+                       L"");
+            appendLine(L"", L"");
+        }
         if (history_.empty()) {
             appendLine(localize(L"暂无求解日志。", L"No solution history yet."), L"");
         }
@@ -1997,6 +2048,8 @@ class SolverApp {
         const std::wstring text = displayedHistory();
         SetWindowTextW(logEdit_, text.c_str());
         mathview::setClickableLineGroups(logEdit_, historyLineGroups_);
+        EnableWindow(logClearButton_, historyReady_);
+        EnableWindow(logImportButton_, historyReady_);
     }
 
     void applyLogTheme() {
@@ -2016,6 +2069,8 @@ class SolverApp {
         SetWindowTheme(logWindow_, explorer, nullptr);
         mathview::setDarkMode(logEdit_, darkMode_);
         SetWindowTheme(logClearButton_, explorer, nullptr);
+        SetWindowTheme(logImportButton_, explorer, nullptr);
+        SetWindowTheme(logExportButton_, explorer, nullptr);
         RedrawWindow(logWindow_, nullptr, nullptr,
                      RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW);
     }
@@ -2049,8 +2104,19 @@ class SolverApp {
                                           scaled(470), scaled(130), scaled(36), logWindow_,
                                           reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLogClearButtonId)),
                                           instance_, nullptr);
+        logImportButton_ =
+            CreateWindowExW(0, L"BUTTON", localize(L"导入日志", L"Import history").c_str(),
+                            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, logWindow_,
+                            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLogImportId)), instance_, nullptr);
+        logExportButton_ =
+            CreateWindowExW(0, L"BUTTON", localize(L"导出日志", L"Export history").c_str(),
+                            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 0, 0, 0, 0, logWindow_,
+                            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLogExportId)), instance_, nullptr);
         SendMessageW(logEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(normalFont_), TRUE);
         SendMessageW(logClearButton_, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont_), TRUE);
+        SendMessageW(logImportButton_, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont_), TRUE);
+        SendMessageW(logExportButton_, WM_SETFONT, reinterpret_cast<WPARAM>(smallFont_), TRUE);
+        SendMessageW(logWindow_, WM_SIZE, 0, 0);
         updateHistoryWindow();
         applyLogTheme();
         ShowWindow(logWindow_, SW_SHOW);
@@ -2216,9 +2282,11 @@ class SolverApp {
         dropdownSelectedIndex_ = std::clamp(selected, 0, static_cast<int>(items.size()) - 1);
         dropdownHoverIndex_ = dropdownSelectedIndex_;
         dropdownAnchor_ = anchor;
-        dropdownWindow_ = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kDropdownWindowClass, L"",
-                                          WS_POPUP | WS_CLIPCHILDREN, x, y, width, height, window_, nullptr,
-                                          instance_, this);
+        // 弹出框归属按钮所在窗口，复用题型选择框的绘制和交互。
+        const HWND owner = GetAncestor(anchor, GA_ROOT);
+        dropdownWindow_ =
+            CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kDropdownWindowClass, L"",
+                            WS_POPUP | WS_CLIPCHILDREN, x, y, width, height, owner, nullptr, instance_, this);
         if (!dropdownWindow_) {
             dropdownKind_ = DropdownKind::None;
             dropdownAnchor_ = nullptr;
@@ -2321,7 +2389,13 @@ class SolverApp {
         DeleteObject(pen);
     }
 
+    bool dropdownItemEnabled(int index) const {
+        return index >= 0 && index < static_cast<int>(dropdownItems_.size());
+    }
+
     void commitDropdownSelection(int index) {
+        if (!dropdownItemEnabled(index))
+            return;
         const DropdownKind kind = dropdownKind_;
         closeDropdown();
         if (kind == DropdownKind::Type) {
@@ -2436,6 +2510,8 @@ class SolverApp {
             SetWindowTextW(logWindow_,
                            localize(L"求解日志（最近 100 条）", L"Solution History (Last 100)").c_str());
             SetWindowTextW(logClearButton_, localize(L"清空日志", L"Clear History").c_str());
+            SetWindowTextW(logImportButton_, localize(L"导入日志", L"Import history").c_str());
+            SetWindowTextW(logExportButton_, localize(L"导出日志", L"Export history").c_str());
             updateHistoryWindow();
             applyLogTheme();
         }
@@ -2499,6 +2575,7 @@ class SolverApp {
         selectedMethod_ = std::clamp(selectedMethod_, 0, static_cast<int>(methodSectionsZh_.size()) - 1);
         const std::wstring displayedProcess = localizedSolverOutput(methodSectionsZh_[selectedMethod_]);
         SetWindowTextW(process_, displayedProcess.c_str());
+        ShowWindow(process_, lastVariableContext_.isRelation ? SW_HIDE : SW_SHOW);
         const bool multiple = methodSectionsZh_.size() > 1;
         ShowWindow(methodLabel_, multiple ? SW_SHOW : SW_HIDE);
         for (int i = 0; i < 3; ++i) {
@@ -2536,9 +2613,10 @@ class SolverApp {
             const auto kind = static_cast<equation::InputKind>(currentType_);
             const equation::SolveResult result = equation::solveText(text, kind, angleUnit_);
             lastSummaryZh_ = result.summary;
-            lastApproximationZh_ = approximationForSummary(result.summary, angleUnit_);
+            lastApproximationZh_ =
+                result.isRelation ? L"" : approximationForSummary(result.summary, angleUnit_);
             lastVariableContext_ = result;
-            if (answerIsTooLong(result.summary)) {
+            if (!result.isRelation && answerIsTooLong(result.summary)) {
                 if (!lastApproximationZh_.empty()) {
                     lastSummaryZh_ = longAnswerApproximation(lastApproximationZh_);
                     lastApproximationZh_.clear();
@@ -2559,9 +2637,10 @@ class SolverApp {
                                         result.summary.find(L"空集") != std::wstring::npos;
             lastSolvedInput_ = result.normalizedInput.empty() ? text : result.normalizedInput;
             lastGraphSystem2_ = equationLines == 2;
-            lastGraphValues_ = realValuesForGraph(result.summary, angleUnit_);
-            graphEnabled_ = !result.usesImaginaryUnit && !inequality && equationLines <= 2 &&
-                            !noRealSolution && !lastGraphValues_.empty() &&
+            lastGraphValues_ = result.isRelation ? std::vector<std::pair<std::wstring, double>>{}
+                                                 : realValuesForGraph(result.summary, angleUnit_);
+            graphEnabled_ = !result.isRelation && !result.usesImaginaryUnit && !inequality &&
+                            equationLines <= 2 && !noRealSolution && !lastGraphValues_.empty() &&
                             (!lastGraphSystem2_ || !graphMarkers().empty());
             EnableWindow(graphButton_, graphEnabled_ ? TRUE : FALSE);
             if (graphEnabled_)
@@ -2753,13 +2832,25 @@ class SolverApp {
         const bool multiPointSystem =
             lastGraphSystem2_ &&
             displayedSummary.find(std::wstring(1, displayedVariable) + L"₃") != std::wstring::npos;
-        const int maxSummaryLines = expandedExactSummary || multiPointSystem ? 6 : 2;
+        const int maxSummaryLines =
+            lastVariableContext_.isRelation ? 64 : (expandedExactSummary || multiPointSystem ? 6 : 2);
         mathview::setMaxVisualLines(resultSummary_, maxSummaryLines);
         const int formattedWidth = mathview::preferredWidth(resultSummary_);
-        const int summaryWidth =
-            twoLineSummary ? rightWidth : std::clamp(formattedWidth, scaled(250), rightWidth);
-        const int summaryHeight =
+        const int summaryWidth = twoLineSummary || lastVariableContext_.isRelation
+                                     ? rightWidth
+                                     : std::clamp(formattedWidth, scaled(250), rightWidth);
+        int summaryHeight =
             std::max(scaled(62), mathview::requiredHeight(resultSummary_, summaryWidth, maxSummaryLines));
+        if (lastVariableContext_.isRelation && summaryHeight > height - scaled(161)) {
+            // 含参数的超长答案没有单一数值近似；明确改用引用当前输入的精确解集。
+            SetWindowTextW(resultSummary_,
+                           localize(L"关系式结果过长。精确隐式解集：满足输入原式及其定义域的全部解。",
+                                    L"The relation result is too long. Exact implicit solution set: all "
+                                    L"values satisfying the input relations and their domains.")
+                               .c_str());
+            summaryHeight =
+                std::max(scaled(62), mathview::requiredHeight(resultSummary_, summaryWidth, maxSummaryLines));
+        }
         MoveWindow(resultSummary_, rightX, scaled(135), summaryWidth, summaryHeight, TRUE);
         const bool multiple = methodSectionsZh_.size() > 1;
         int processTop = scaled(135) + summaryHeight + scaled(8);
@@ -2931,7 +3022,8 @@ class SolverApp {
             auto* item = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
             if (!item || item->CtlID != kDropdownListId || item->itemID == static_cast<UINT>(-1))
                 return FALSE;
-            const bool selected = (item->itemState & ODS_SELECTED) != 0;
+            const bool enabled = dropdownItemEnabled(static_cast<int>(item->itemID));
+            const bool selected = enabled && (item->itemState & ODS_SELECTED) != 0;
             const COLORREF background = selected ? (darkMode_ ? RGB(59, 79, 116) : RGB(224, 235, 255))
                                                  : (darkMode_ ? RGB(57, 59, 70) : RGB(255, 255, 255));
             HBRUSH brush = CreateSolidBrush(background);
@@ -2940,7 +3032,8 @@ class SolverApp {
             wchar_t label[256]{};
             SendMessageW(item->hwndItem, LB_GETTEXT, item->itemID, reinterpret_cast<LPARAM>(label));
             SetBkMode(item->hDC, TRANSPARENT);
-            SetTextColor(item->hDC, darkMode_ ? RGB(242, 244, 248) : RGB(27, 36, 49));
+            SetTextColor(item->hDC, enabled ? (darkMode_ ? RGB(242, 244, 248) : RGB(27, 36, 49))
+                                            : (darkMode_ ? RGB(145, 151, 162) : RGB(130, 137, 148)));
             RECT textRect = item->rcItem;
             textRect.left += scaled(14);
             textRect.right -= scaled(10);
@@ -3100,8 +3193,14 @@ class SolverApp {
             const int height = std::max(scaled(240), static_cast<int>(client.bottom));
             MoveWindow(logEdit_, scaled(16), scaled(16), width - scaled(32), height - scaled(82), TRUE);
             MoveWindow(logClearButton_, scaled(16), height - scaled(52), scaled(138), scaled(36), TRUE);
+            MoveWindow(logImportButton_, width - scaled(292), height - scaled(52), scaled(132), scaled(36),
+                       TRUE);
+            MoveWindow(logExportButton_, width - scaled(148), height - scaled(52), scaled(132), scaled(36),
+                       TRUE);
             roundControl(logEdit_, scaled(18));
             roundControl(logClearButton_, scaled(18));
+            roundControl(logImportButton_, scaled(18));
+            roundControl(logExportButton_, scaled(18));
             return 0;
         }
         case WM_GETMINMAXINFO: {
@@ -3126,6 +3225,11 @@ class SolverApp {
             drawOwnerButton(*reinterpret_cast<DRAWITEMSTRUCT*>(lParam));
             return TRUE;
         case WM_COMMAND:
+            if (LOWORD(wParam) == kLogExportId || LOWORD(wParam) == kLogImportId) {
+                if (LOWORD(wParam) == kLogExportId || historyReady_)
+                    transferHistory(LOWORD(wParam) == kLogExportId);
+                return 0;
+            }
             if (LOWORD(wParam) == kLogEditId && HIWORD(wParam) == mathview::kLineClickedNotification) {
                 const int line = mathview::lastClickedLine(logEdit_);
                 if (line >= 0 && line < static_cast<int>(historyLineTargets_.size()) &&
@@ -3145,9 +3249,9 @@ class SolverApp {
                     hwnd, localize(L"确定清空全部求解日志吗？", L"Clear all solution history?").c_str(),
                     localize(L"清空日志", L"Clear History").c_str(),
                     MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
-                if (answer == IDYES) {
+                if (answer == IDYES && persistHistory({})) {
                     history_.clear();
-                    saveHistory(history_);
+                    historyWasReset_ = false;
                     updateHistoryWindow();
                 }
             }
@@ -3159,6 +3263,8 @@ class SolverApp {
             logWindow_ = nullptr;
             logEdit_ = nullptr;
             logClearButton_ = nullptr;
+            logImportButton_ = nullptr;
+            logExportButton_ = nullptr;
             return 0;
         }
         return DefWindowProcW(hwnd, message, wParam, lParam);
@@ -3325,6 +3431,8 @@ class SolverApp {
     HWND logWindow_{};
     HWND logEdit_{};
     HWND logClearButton_{};
+    HWND logImportButton_{};
+    HWND logExportButton_{};
     HWND dropdownWindow_{};
     HWND dropdownList_{};
     HWND dropdownAnchor_{};
@@ -3344,6 +3452,9 @@ class SolverApp {
     std::wstring lastApproximationZh_;
     std::vector<std::wstring> methodSectionsZh_;
     std::vector<HistoryEntry> history_;
+    std::optional<history::Store> historyStore_;
+    bool historyReady_ = false;
+    bool historyWasReset_ = false;
     std::vector<std::wstring> historyLineTargets_;
     std::vector<std::pair<int, int>> historyLineGroups_;
     equation::SolveResult lastVariableContext_;

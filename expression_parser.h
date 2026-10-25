@@ -21,7 +21,8 @@ enum class InputKind {
     Linear3,
     Inequality,
     Fraction,
-    Trigonometric
+    Trigonometric,
+    Relation
 };
 enum class AngleUnit { Radians, Degrees };
 

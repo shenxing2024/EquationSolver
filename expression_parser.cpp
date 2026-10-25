@@ -4,6 +4,7 @@
 #include "expression_parser.h"
 
 #include "complex_solver.h"
+#include "relation_solver.h"
 
 #include <algorithm>
 #include <array>
@@ -197,7 +198,11 @@ std::optional<IntegerEquation> toIntegerEquation(const std::array<double, 4>& va
     }
     IntegerEquation result;
     for (size_t i = 0; i < values.size(); ++i) {
-        result.values[i] = fractions[i].numerator * (commonDenominator / fractions[i].denominator);
+        const auto scale = commonDenominator / fractions[i].denominator;
+        const auto bound = std::numeric_limits<std::int64_t>::max() / scale;
+        if (fractions[i].numerator < -bound || fractions[i].numerator > bound)
+            return std::nullopt;
+        result.values[i] = fractions[i].numerator * scale;
     }
     std::int64_t divisor = 0;
     for (const auto value : result.values)
@@ -4264,6 +4269,134 @@ std::optional<SolveResult> solveTrigEquation(const std::wstring& text, AngleUnit
     return SolveResult{summary, process.str()};
 }
 
+// 一次关系式只做等价移项，不把自由字母误当成已经求出的数值根。
+SolveResult solveLinearRelation(const std::wstring& text, int variableCount, AngleUnit angleUnit) {
+    Parser parser(text, angleUnit);
+    const ParsedRelation parsed = parser.parseRelation();
+    if (parsed.relation != TokenType::Equal)
+        throw ParseError("关系式求解只支持等号 =");
+    if (parser.fractionalScale() != 1)
+        throw ParseError("关系式求解暂不支持分数指数");
+    const RationalExpression difference = add(parsed.left, parsed.right, -1.0);
+    if (!difference.denominator.isConstant())
+        throw ParseError("关系式求解暂不支持未知数位于分母");
+    const auto& polynomial = difference.numerator;
+    if (polynomial.totalDegree() > 1)
+        throw ParseError("关系式求解目前只支持一次等式");
+    const std::array<double, 4> coefficients{polynomial.coefficient(1), polynomial.coefficient(0, 1),
+                                             polynomial.coefficient(0, 0, 1), polynomial.coefficient(0)};
+    const auto integers = toIntegerEquation(coefficients);
+    const auto nonzero = [&](int index) {
+        return integers ? integers->values[index] != 0 : std::abs(coefficients[index]) >= kEpsilon;
+    };
+    const auto negative = [&](int index) {
+        return integers ? integers->values[index] < 0 : coefficients[index] < 0;
+    };
+    const auto magnitudeText = [&](int index) {
+        if (!integers)
+            return symbolicNumber(std::abs(coefficients[index]));
+        const auto value = integers->values[index];
+        return std::to_wstring(value < 0 ? -value : value);
+    };
+
+    SolveResult result;
+    result.isRelation = true;
+    std::vector<int> order;
+    for (int index = 0; index < variableCount; ++index)
+        if (nonzero(index))
+            order.push_back(index);
+    if (order.empty()) {
+        if (nonzero(3)) {
+            result.summary = L"结论：方程无解";
+            return result;
+        }
+        if (variableCount == 0)
+            result.summary = L"结论：等式恒成立";
+    }
+    // 优先显示系数为 ±1 的字母；例如 6a+b=1 先显示 b，再显示 a。
+    std::stable_sort(order.begin(), order.end(), [&](int left, int right) {
+        return (magnitudeText(left) == L"1") > (magnitudeText(right) == L"1");
+    });
+    constexpr wchar_t names[] = {L'x', L'y', L'z'};
+    for (const int target : order) {
+        struct Term {
+            bool negative;
+            std::wstring magnitude;
+            std::wstring variable;
+        };
+        const bool reversed = negative(target);
+        std::vector<Term> terms;
+        // 常数项先写，便于得到 1-6a 和 (1-b)/6 这种形式。
+        if (nonzero(3))
+            terms.push_back({negative(3) == reversed, magnitudeText(3), L""});
+        for (int index = 0; index < variableCount; ++index) {
+            if (index != target && nonzero(index))
+                terms.push_back(
+                    {negative(index) == reversed, magnitudeText(index), std::wstring(1, names[index])});
+        }
+        const std::wstring denominator = magnitudeText(target);
+        bool outerNegative = false;
+        if (denominator != L"1" && !terms.empty()) {
+            outerNegative =
+                std::all_of(terms.begin(), terms.end(), [](const Term& term) { return term.negative; });
+            if (outerNegative)
+                for (auto& term : terms)
+                    term.negative = false;
+            else if (terms.front().negative)
+                std::stable_partition(terms.begin(), terms.end(),
+                                      [](const Term& term) { return !term.negative; });
+        }
+        std::wstring numerator;
+        for (const auto& term : terms) {
+            if (numerator.empty())
+                numerator += term.negative ? L"-" : L"";
+            else
+                numerator += term.negative ? L" - " : L" + ";
+            if (term.variable.empty() || term.magnitude != L"1") {
+                // 分数系数与字母相乘时加括号，避免把字母误画到分母中。
+                numerator += !term.variable.empty() && term.magnitude.find(L'/') != std::wstring::npos
+                                 ? L"(" + term.magnitude + L")·"
+                                 : term.magnitude;
+            }
+            numerator += term.variable;
+        }
+        if (numerator.empty())
+            numerator = L"0";
+        std::wstring expression = numerator;
+        if (denominator != L"1" && numerator != L"0") {
+            const bool groupNumerator = terms.size() > 1;
+            const bool groupDenominator = denominator.find_first_of(L"/+· ") != std::wstring::npos;
+            expression = (outerNegative ? L"-" : L"") +
+                         (groupNumerator ? L"(" + numerator + L")" : numerator) + L"/" +
+                         (groupDenominator ? L"(" + denominator + L")" : denominator);
+        }
+        if (!result.summary.empty())
+            result.summary += L"\r\n";
+        result.summary += std::wstring(1, names[target]) + L" = " + expression;
+    }
+    // 化简后消失的字母没有约束，明确保留为自由字母。
+    for (int index = 0; index < variableCount; ++index) {
+        if (!nonzero(index)) {
+            if (!result.summary.empty())
+                result.summary += L"\r\n";
+            result.summary += std::wstring(1, names[index]) + L" ∈ ℝ";
+        }
+    }
+    return result;
+}
+
+SolveResult solveRelationText(const std::wstring& text, int variableCount, AngleUnit angleUnit) {
+    // 保留一次式原有的紧凑排版；其他语法由独立的精确符号解析器处理。
+    if (text.find_first_of(L"\n;；πe") == std::wstring::npos && text.find(L"pi") == std::wstring::npos &&
+        !hasImaginaryUnitToken(text)) {
+        try {
+            return solveLinearRelation(text, variableCount, angleUnit);
+        } catch (const ParseError&) {
+        }
+    }
+    return solveGeneralRelation(text, variableCount, angleUnit);
+}
+
 InputKind detectKind(const std::vector<std::wstring>& lines, AngleUnit angleUnit) {
     if (lines.size() == 2) {
         int maximumDegree = 0;
@@ -4289,7 +4422,7 @@ InputKind detectKind(const std::vector<std::wstring>& lines, AngleUnit angleUnit
         difference.denominator.usesVariable(2))
         return InputKind::Fraction;
     if (difference.numerator.usesVariable(1) || difference.numerator.usesVariable(2)) {
-        throw ParseError("含 y 或 z 的方程组请每个方程输入一行");
+        return InputKind::Relation;
     }
     const int degree = difference.numerator.degree(0);
     if (degree >= 4)
@@ -4324,12 +4457,13 @@ SolveResult solveText(const std::wstring& text, InputKind kind, AngleUnit angleU
                 ++after;
             return after < text.size() && isOpeningGrouping(text[after]);
         };
-        const wchar_t* functionName =
-            functionAt(L"sin")
-                ? L"sin"
-                : (functionAt(L"cos")
-                       ? L"cos"
-                       : (functionAt(L"tan") ? L"tan" : (functionAt(L"cot") ? L"cot" : nullptr)));
+        const wchar_t* functionName = nullptr;
+        for (const auto* name : {L"factorial", L"sqrt", L"cbrt", L"asin", L"acos", L"atan", L"acot", L"exp",
+                                 L"log", L"sin", L"cos", L"tan", L"cot", L"abs", L"ln"})
+            if (functionAt(name)) {
+                functionName = name;
+                break;
+            }
         if (functionName) {
             normalized += functionName;
             sourceIndex += std::wcslen(functionName);
@@ -4381,9 +4515,12 @@ SolveResult solveText(const std::wstring& text, InputKind kind, AngleUnit angleU
     if (lines.empty())
         throw ParseError("请输入需要求解的原方程或不等式");
     SolveResult result;
-    if (hasImaginaryUnitToken(normalized))
+    if (kind == InputKind::Relation ||
+        (kind == InputKind::Auto && lines.size() == 1 && variableKeys.size() > 1)) {
+        result = solveRelationText(normalized, static_cast<int>(variableKeys.size()), angleUnit);
+    } else if (hasImaginaryUnitToken(normalized))
         result = solveComplexText(normalized, displayRootNotation(text));
-    if (!result.usesImaginaryUnit && lines.size() == 1) {
+    if (result.summary.empty() && !result.usesImaginaryUnit && lines.size() == 1) {
         if (const auto trigResult = solveTrigEquation(lines.front(), angleUnit))
             result = *trigResult;
     }
@@ -4398,7 +4535,9 @@ SolveResult solveText(const std::wstring& text, InputKind kind, AngleUnit angleU
         }
         if (kind == InputKind::Auto)
             kind = detectKind(lines, angleUnit);
-        if (kind == InputKind::Linear2)
+        if (kind == InputKind::Relation)
+            result = solveRelationText(lines.front(), static_cast<int>(variableKeys.size()), angleUnit);
+        else if (kind == InputKind::Linear2)
             result = solveSystem(lines, 2, angleUnit);
         else if (kind == InputKind::Quadratic2)
             result = solveQuadraticSystem(lines, angleUnit);
